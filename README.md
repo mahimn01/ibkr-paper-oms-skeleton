@@ -110,12 +110,6 @@ Set `TRADING_DB_PATH=trading_audit.sqlite3` and the CLI/Engine will log:
 - `order_status_events` (status snapshots like Submitted/Filled/Cancelled)
 - `errors` (exceptions + key failures)
 
-## Next steps
-
-- Replace `ExampleStrategy` with your actual signal logic.
-- Add proper risk checks in `trading_algo/risk.py`.
-- Add persistence (fills, PnL, state) and monitoring (metrics/alerts).
-
 ## Docs
 
 - `docs/ARCHITECTURE.md`
