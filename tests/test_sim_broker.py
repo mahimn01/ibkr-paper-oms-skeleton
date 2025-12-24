@@ -103,7 +103,7 @@ class TestSimBroker(unittest.TestCase):
                 inst,
                 [Bar(timestamp_epoch_s=1, open=1, high=2, low=0.5, close=1.5, volume=10)],
             )
-            bars = broker.get_historical_bars(inst, duration="1 D", bar_size="5 mins")
+            bars = broker.get_historical_bars(inst, end_datetime=None, duration="1 D", bar_size="5 mins")
             self.assertEqual(len(bars), 1)
             self.assertEqual(bars[0].close, 1.5)
         finally:

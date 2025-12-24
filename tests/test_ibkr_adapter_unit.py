@@ -214,7 +214,7 @@ class TestIBKRAdapterUnit(unittest.TestCase):
 
     def test_history_calls_req_historical_data(self):
         broker = self._make_broker()
-        bars = broker.get_historical_bars(InstrumentSpec(kind="STK", symbol="AAPL"), duration="1 D", bar_size="5 mins")
+        bars = broker.get_historical_bars(InstrumentSpec(kind="STK", symbol="AAPL"), end_datetime=None, duration="1 D", bar_size="5 mins")
         self.assertEqual(len(bars), 2)
         calls = [c for c in broker._ib.calls if c[0] == "reqHistoricalData"]
         self.assertEqual(len(calls), 1)

@@ -96,6 +96,7 @@ class Broker(Protocol):
         self,
         instrument: InstrumentSpec,
         *,
+        end_datetime: str | None = None,
         duration: str,
         bar_size: str,
         what_to_show: str = "TRADES",

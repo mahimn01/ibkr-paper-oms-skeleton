@@ -402,6 +402,7 @@ class IBKRBroker:
         self,
         instrument: InstrumentSpec,
         *,
+        end_datetime: str | None = None,
         duration: str,
         bar_size: str,
         what_to_show: str = "TRADES",
@@ -411,23 +412,26 @@ class IBKRBroker:
             raise RuntimeError("Broker is not connected")
         instrument = validate_instrument(instrument)
         contract = self._qualify(self._to_contract(instrument))
+        end_dt = _parse_ibkr_end_datetime(end_datetime)
         bars = self._ib.reqHistoricalData(
             contract,
-            endDateTime="",
+            endDateTime=end_dt,
             durationStr=str(duration),
             barSizeSetting=str(bar_size),
             whatToShow=str(what_to_show),
             useRTH=1 if use_rth else 0,
-            formatDate=1,
+            # Use epoch timestamps for robust parsing.
+            formatDate=2,
         )
         out: list[Bar] = []
         for b in list(bars or []):
             ts = getattr(b, "date", None)
-            # ib_insync returns date as datetime or string; keep epoch best-effort.
             ts_epoch = time.time()
             try:
                 if hasattr(ts, "timestamp"):
                     ts_epoch = float(ts.timestamp())
+                else:
+                    ts_epoch = float(ts)
             except Exception:
                 pass
             out.append(
@@ -537,6 +541,37 @@ def _find_trade(ib: Any, order_id: str) -> Any | None:
     except Exception:
         return None
     return None
+
+
+def _parse_ibkr_end_datetime(value: str | None):
+    """
+    ib_insync accepts endDateTime as '' (now), a datetime, or an IB-formatted string.
+    We also accept epoch seconds or ISO-8601 strings for convenience.
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s == "":
+        return ""
+    # Epoch seconds
+    try:
+        epoch = float(s)
+    except Exception:
+        epoch = None
+    if epoch is not None:
+        import datetime as dt
+
+        return dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc)
+    # ISO-8601
+    try:
+        import datetime as dt
+
+        iso = s
+        if iso.endswith("Z"):
+            iso = iso[:-1] + "+00:00"
+        return dt.datetime.fromisoformat(iso)
+    except Exception:
+        return s
 
 
 def _preflight_check_socket(host: str, port: int) -> None:

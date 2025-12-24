@@ -17,6 +17,10 @@ from trading_algo.orders import TradeIntent
 from trading_algo.persistence import SqliteStore
 from trading_algo.strategy.example import ExampleStrategy
 from trading_algo.oms import OrderManager
+from trading_algo.backtest.data import load_bars_csv
+from trading_algo.backtest.runner import BacktestConfig, run_backtest
+from trading_algo.backtest.export import ExportConfig, export_historical_bars
+from trading_algo.backtest.validate import validate_bars
 
 
 def _load_dotenv_if_present() -> None:
@@ -477,6 +481,65 @@ def _cmd_oms_track(args: argparse.Namespace) -> int:
         broker.disconnect()
 
 
+def _cmd_backtest(args: argparse.Namespace) -> int:
+    instrument = validate_instrument(
+        InstrumentSpec(kind=args.kind, symbol=args.symbol, exchange=args.exchange, currency=args.currency, expiry=args.expiry)
+    )
+    series = load_bars_csv(args.csv, instrument)
+    cfg = BacktestConfig(
+        initial_cash=float(args.initial_cash),
+        commission_per_order=float(args.commission_per_order),
+        slippage_bps=float(args.slippage_bps),
+        spread=float(args.spread),
+        db_path=args.db_path,
+    )
+    res = run_backtest(ExampleStrategy(symbol=instrument.symbol), instrument, series.bars, cfg)
+    print(f"start={res.start_equity} end={res.end_equity} returnPct={res.return_pct}")
+    return 0
+
+
+def _cmd_export_history(args: argparse.Namespace) -> int:
+    cfg = _apply_cli_overrides(TradingConfig.from_env(), args)
+    if args.broker != "ibkr":
+        raise SystemExit("export-history currently supports only --broker ibkr")
+    import os
+
+    if os.path.exists(args.out_csv) and not args.overwrite:
+        raise SystemExit(f"Refusing to overwrite existing file: {args.out_csv} (use --overwrite)")
+    broker = _make_broker("ibkr", cfg)
+    broker.connect()
+    try:
+        instrument = validate_instrument(
+            InstrumentSpec(kind=args.kind, symbol=args.symbol, exchange=args.exchange, currency=args.currency, expiry=args.expiry)
+        )
+        export_cfg = ExportConfig(
+            duration_per_call=args.duration_per_call,
+            bar_size=args.bar_size,
+            what_to_show=args.what_to_show,
+            use_rth=bool(args.use_rth),
+            pacing_sleep_seconds=float(args.pacing_sleep_seconds),
+            max_calls=int(args.max_calls),
+        )
+        bars = export_historical_bars(
+            broker,
+            instrument,
+            out_csv_path=args.out_csv,
+            cfg=export_cfg,
+            end_datetime=args.end_datetime,
+        )
+        if args.validate:
+            issues = validate_bars(bars)
+            errors = [i for i in issues if i.level == "error"]
+            for i in issues:
+                print(f"{i.level}: {i.message}")
+            if errors:
+                raise SystemExit("bar validation failed")
+        print(f"wrote={args.out_csv} bars={len(bars)}")
+        return 0
+    finally:
+        broker.disconnect()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="trading-algo", description="IBKR paper trading algo skeleton")
     p.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
@@ -607,6 +670,39 @@ def build_parser() -> argparse.ArgumentParser:
     track.add_argument("--poll-seconds", default="1.0")
     track.add_argument("--timeout-seconds", default=None)
     track.set_defaults(func=_cmd_oms_track)
+
+    bt = sub.add_parser("backtest", help="Run a deterministic historical backtest from a CSV file")
+    bt.add_argument("--csv", required=True, help="CSV with columns: timestamp,open,high,low,close[,volume]")
+    bt.add_argument("--kind", choices=["STK", "FUT", "FX"], default="STK")
+    bt.add_argument("--symbol", required=True)
+    bt.add_argument("--exchange", default=None)
+    bt.add_argument("--currency", default=None)
+    bt.add_argument("--expiry", default=None)
+    bt.add_argument("--initial-cash", type=float, default=100000.0)
+    bt.add_argument("--commission-per-order", type=float, default=0.0)
+    bt.add_argument("--slippage-bps", type=float, default=0.0)
+    bt.add_argument("--spread", type=float, default=0.0)
+    bt.add_argument("--db-path", default=None)
+    bt.set_defaults(func=_cmd_backtest)
+
+    exp = sub.add_parser("export-history", help="Export IBKR historical bars to a backtest CSV")
+    exp.add_argument("--broker", choices=["ibkr"], default="ibkr")
+    exp.add_argument("--kind", choices=["STK", "FUT", "FX"], default="STK")
+    exp.add_argument("--symbol", required=True)
+    exp.add_argument("--exchange", default=None)
+    exp.add_argument("--currency", default=None)
+    exp.add_argument("--expiry", default=None)
+    exp.add_argument("--out-csv", required=True)
+    exp.add_argument("--overwrite", action="store_true")
+    exp.add_argument("--bar-size", default="5 mins")
+    exp.add_argument("--duration-per-call", default="30 D")
+    exp.add_argument("--what-to-show", default="TRADES")
+    exp.add_argument("--use-rth", action="store_true")
+    exp.add_argument("--end-datetime", default=None, help="IBKR endDateTime; empty means now. Epoch/ISO are accepted.")
+    exp.add_argument("--pacing-sleep-seconds", default="0.25")
+    exp.add_argument("--max-calls", default="500")
+    exp.add_argument("--validate", action="store_true")
+    exp.set_defaults(func=_cmd_export_history)
 
     return p
 

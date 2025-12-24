@@ -94,3 +94,22 @@ class TestIBKRPaperIntegration(unittest.TestCase):
                 oms.track_open_orders(poll_seconds=0.2, timeout_seconds=1.0)
             finally:
                 oms.close()
+
+    def test_export_history_and_backtest_roundtrip(self):
+        import tempfile
+
+        from trading_algo.backtest.export import ExportConfig, export_historical_bars
+        from trading_algo.backtest.runner import BacktestConfig, run_backtest
+        from trading_algo.strategy.example import ExampleStrategy
+
+        inst = InstrumentSpec(kind="STK", symbol="AAPL")
+        with tempfile.NamedTemporaryFile(suffix=".csv") as f:
+            bars = export_historical_bars(
+                self.broker,
+                inst,
+                out_csv_path=f.name,
+                cfg=ExportConfig(duration_per_call="2 D", bar_size="5 mins", pacing_sleep_seconds=0.25, max_calls=5),
+            )
+            self.assertGreater(len(bars), 0)
+            res = run_backtest(ExampleStrategy(symbol="AAPL"), inst, bars, BacktestConfig(initial_cash=100000))
+            self.assertIsNotNone(res.end_equity)

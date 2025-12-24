@@ -80,6 +80,13 @@ python3 -m trading_algo.cli snapshot --broker ibkr --kind FX --symbol EURUSD
 python3 -m trading_algo.cli history --broker ibkr --kind STK --symbol AAPL --duration "1 D" --bar-size "5 mins"
 ```
 
+## Historical backtests (IBKR -> CSV -> deterministic)
+
+```bash
+python3 -m trading_algo.cli export-history --broker ibkr --kind STK --symbol AAPL --bar-size "5 mins" --duration-per-call "30 D" --out-csv data/AAPL_5m.csv --validate
+python3 -m trading_algo.cli backtest --csv data/AAPL_5m.csv --kind STK --symbol AAPL
+```
+
 ## Paper smoke test
 
 ```bash

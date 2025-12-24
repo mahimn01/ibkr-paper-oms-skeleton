@@ -39,3 +39,21 @@ Sim:
 IBKR (paper):
 - `python3 -m trading_algo.autorun --broker ibkr --ibkr-port 7497 --confirm-token "$TRADING_ORDER_TOKEN"`
 
+## IBKR historical backtests (recommended workflow)
+
+1) Export historical bars from IBKR to a CSV:
+
+```bash
+python3 -m trading_algo.cli export-history --broker ibkr --kind STK --symbol AAPL \
+  --bar-size "5 mins" --duration-per-call "30 D" --out-csv data/AAPL_5m.csv --validate
+```
+
+2) Run a deterministic backtest from the CSV:
+
+```bash
+python3 -m trading_algo.cli backtest --csv data/AAPL_5m.csv --kind STK --symbol AAPL
+```
+
+Notes:
+- IBKR historical data availability depends on your permissions/subscriptions and pacing limits.
+- Export once, then iterate on your strategy using the same CSV for repeatable results.
