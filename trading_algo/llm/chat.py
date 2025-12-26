@@ -300,9 +300,16 @@ def main(argv: list[str] | None = None) -> int:
 
             print(f"{_c('1;34')}assistant>{_reset()} ", end="", flush=True)
 
-            def _on_token(tok: str) -> None:
-                sys.stdout.write(tok)
-                sys.stdout.flush()
+            # In streaming mode the model output is structured JSON; we don't print raw chunks.
+            # Instead, show a lightweight progress indicator while we stream into a buffer.
+            stream_chunks = 0
+
+            def _on_token(_tok: str) -> None:
+                nonlocal stream_chunks
+                stream_chunks += 1
+                if stream_chunks in {1, 25, 50, 100, 200, 400}:
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
 
             executed: list[tuple[ToolCall, bool, Any]] = []
 
@@ -322,6 +329,12 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if session.stream:
                 print()
+
+            # If we didn't stream human-readable text (we only show dots), print the final message now.
+            if reply.assistant_message.strip():
+                print(reply.assistant_message)
+            else:
+                print("(no assistant_message returned)")
 
             if executed:
                 print(_banner("Tool Calls"))
