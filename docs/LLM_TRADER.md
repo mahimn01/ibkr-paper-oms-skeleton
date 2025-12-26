@@ -34,6 +34,14 @@ LLM_ALLOWED_SYMBOLS=AAPL \
 python3 -m trading_algo.cli llm-run --broker sim --once
 ```
 
+## Terminal chat (interactive)
+
+```bash
+LLM_ENABLED=true LLM_PROVIDER=gemini GEMINI_API_KEY=... \
+LLM_ALLOWED_SYMBOLS=AAPL \
+python3 -m trading_algo.cli chat --broker sim
+```
+
 ## Run (IBKR paper)
 
 ```bash
@@ -48,4 +56,3 @@ export LLM_ALLOWED_SYMBOLS=AAPL
 
 python3 -m trading_algo.cli --confirm-token "$TRADING_ORDER_TOKEN" llm-run --broker ibkr --once
 ```
-

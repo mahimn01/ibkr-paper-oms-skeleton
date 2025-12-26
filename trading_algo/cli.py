@@ -580,6 +580,29 @@ def _cmd_llm_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_chat(args: argparse.Namespace) -> int:
+    from trading_algo.llm.chat import main as chat_main
+
+    argv: list[str] = []
+    if args.broker is not None:
+        argv += ["--broker", str(args.broker)]
+    if args.confirm_token is not None:
+        argv += ["--confirm-token", str(args.confirm_token)]
+    if args.ibkr_host is not None:
+        argv += ["--ibkr-host", str(args.ibkr_host)]
+    if args.ibkr_port is not None:
+        argv += ["--ibkr-port", str(args.ibkr_port)]
+    if args.ibkr_client_id is not None:
+        argv += ["--ibkr-client-id", str(args.ibkr_client_id)]
+    if bool(args.no_stream):
+        argv += ["--no-stream"]
+    if bool(args.show_raw):
+        argv += ["--show-raw"]
+    if bool(args.no_color):
+        argv += ["--no-color"]
+    return int(chat_main(argv))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="trading-algo", description="IBKR paper trading algo skeleton")
     p.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
@@ -750,6 +773,13 @@ def build_parser() -> argparse.ArgumentParser:
     llm_run.add_argument("--max-ticks", type=int, default=None)
     llm_run.add_argument("--once", action="store_true", help="Run exactly one LLM tick")
     llm_run.set_defaults(func=_cmd_llm_run)
+
+    chat = sub.add_parser("chat", help="Interactive terminal chat (Gemini + OMS tools)")
+    chat.add_argument("--broker", choices=["ibkr", "sim"], default=None)
+    chat.add_argument("--no-stream", action="store_true")
+    chat.add_argument("--show-raw", action="store_true")
+    chat.add_argument("--no-color", action="store_true")
+    chat.set_defaults(func=_cmd_chat)
 
     return p
 
