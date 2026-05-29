@@ -17,7 +17,7 @@ Gates (all must pass for APPROVED):
 Inputs:
     returns: 1-D array of per-period strategy returns (e.g. daily)
     n_trials: total parameter combinations explored historically (for DSR)
-    trial_grid: optional (N x T) matrix used by CSCV; None disables PBO
+    trial_grid: optional (T x N) matrix used by CSCV; None disables PBO
     period_start / period_end / periods_per_year: metadata for MinTRL
     walk_forward_window: int (periods per fold for the rolling test)
 
@@ -55,6 +55,18 @@ from trading_algo.quant_core.validation.stationary_bootstrap import (
 # --------------------------------------------------------------------------
 
 
+# Gates that MUST be present (not silently omitted) before a card can be
+# APPROVED. These are the overfitting (PBO), significance (DSR), edge (Sharpe
+# CI), and net-of-cost (cost-adjusted) gates — certifying a strategy without
+# any of them is the rubber-stamp failure mode the gate exists to prevent.
+REQUIRED_GATES: tuple[str, ...] = (
+    "Lower 95% CI on annualised Sharpe",
+    "PBO (CSCV)",
+    "Deflated Sharpe",
+    "Cost-adjusted Sharpe",
+)
+
+
 @dataclass
 class GateResult:
     name: str
@@ -83,13 +95,30 @@ class ReportCard:
 
     gates: list[GateResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    required_gates: tuple[str, ...] = REQUIRED_GATES
+
+    @property
+    def missing_required_gates(self) -> list[str]:
+        present = {g.name for g in self.gates}
+        return [r for r in self.required_gates if r not in present]
 
     @property
     def status(self) -> str:
-        """Overall status: APPROVED iff every populated gate passes."""
+        """Overall status.
+
+        - BLOCKED    if any present gate fails (or no gates ran at all).
+        - INCOMPLETE if every present gate passes but a required gate is
+          missing — we cannot certify a strategy whose overfitting/cost gates
+          never ran. (Distinct from BLOCKED: missing evidence, not failed.)
+        - APPROVED   only when every required gate is present AND all pass.
+        """
         if not self.gates:
             return "BLOCKED"
-        return "APPROVED" if all(g.passed for g in self.gates) else "BLOCKED"
+        if any(not g.passed for g in self.gates):
+            return "BLOCKED"
+        if self.missing_required_gates:
+            return "INCOMPLETE"
+        return "APPROVED"
 
     def render(self) -> str:
         """Render as markdown report card (PLAN.md §2.7 acceptance gate output)."""
@@ -112,6 +141,10 @@ class ReportCard:
             lines.append(f"| {g.name} | {v} | {g.threshold} | {mark} |")
         lines.append("")
         lines.append(f"**Status:** {self.status}")
+        missing = self.missing_required_gates
+        if missing:
+            lines.append("")
+            lines.append(f"**Missing required gates:** {', '.join(missing)}")
         if self.warnings:
             lines.append("")
             lines.append("**Warnings:**")
@@ -221,8 +254,9 @@ def build_report_card(
             is by `periods_per_year` (252 daily, 12 monthly, etc.).
         n_trials: how many parameter combinations were searched in the
             study leading to this strategy. Used by Deflated Sharpe.
-        trial_grid: optional (N x T) matrix of returns across N strategy
-            variants over T periods. When supplied, CSCV PBO is computed.
+        trial_grid: optional (T x N) matrix of returns — T periods (rows)
+            across N strategy variants (columns). When supplied, CSCV PBO is
+            computed. (The CSCV calculator partitions rows into time-groups.)
         cost_adjusted_returns: optional separate return stream after
             additional friction (e.g. spread + impact + borrow). Used for
             the cost-adjusted-Sharpe gate.
@@ -280,20 +314,29 @@ def build_report_card(
     try:
         from scipy import stats as _stats
         ds = DeflatedSharpe()
+        # The Bailey-LdP deflation variance is defined on the PER-PERIOD Sharpe.
+        # point_sharpe is annualised (× sqrt(periods_per_year)); passing it
+        # directly inflates the z-statistic ~sqrt(ppy)× and makes the gate pass
+        # for almost any positive Sharpe. De-annualise before deflating.
+        sr_per_period = rc.point_sharpe / math.sqrt(periods_per_year)
         ds_res = ds.calculate(
-            observed_sharpe=rc.point_sharpe,
+            observed_sharpe=sr_per_period,
             n_trials=max(1, n_trials),
             n_observations=int(arr.size),
             skewness=float(_stats.skew(arr)),
             kurtosis=float(_stats.kurtosis(arr, fisher=False)),
             correlation=0.0,
         )
-        rc.deflated_sharpe = float(ds_res.deflated_sharpe)
+        # The DSR gate is a PROBABILITY: P(true Sharpe > 0 after deflating for
+        # multiple testing) = norm.cdf(z) = 1 - p_value. ds_res.deflated_sharpe
+        # is the raw z-statistic, not the probability — gate on the probability.
+        rc.deflated_sharpe = float(1.0 - ds_res.p_value)
         rc.gates.append(GateResult(
             name="Deflated Sharpe",
             value=rc.deflated_sharpe,
             threshold="> 0.95",
             passed=rc.deflated_sharpe > 0.95,
+            note=f"z={ds_res.deflated_sharpe:.2f}",
         ))
     except Exception as exc:
         rc.warnings.append(f"DSR computation failed: {exc}")
