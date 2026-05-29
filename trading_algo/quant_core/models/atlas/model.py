@@ -161,7 +161,7 @@ class ATLASModel(nn.Module):
         temporal = self.mamba(selected)                     # (B, L, d_model)
 
         # 5. De-stationary attention modulation
-        tau, delta = self.de_stationary(pre_norm_sigma, temporal)
+        tau, delta = self.de_stationary(pre_norm_mu, pre_norm_sigma, temporal)
 
         # 6a. Causal self-attention (last position)
         self_attn_out = self.self_attention(temporal, tau, delta)  # (B, d_model)
@@ -200,7 +200,7 @@ class ATLASModel(nn.Module):
 
         selected, _ = self.vsn(token)
         temporal = self.mamba(selected)
-        tau, delta = self.de_stationary(pre_norm_sigma, temporal)
+        tau, delta = self.de_stationary(pre_norm_mu, pre_norm_sigma, temporal)
         self_attn_out = self.self_attention(temporal, tau, delta)
         cross_attn_out, _ = self.cross_attention(
             self_attn_out, self.memory_keys, self.memory_values,

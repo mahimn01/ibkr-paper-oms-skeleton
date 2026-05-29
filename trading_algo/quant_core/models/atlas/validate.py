@@ -7,6 +7,11 @@ import torch
 import torch.nn as nn
 
 from trading_algo.quant_core.models.atlas.config import ATLASConfig
+from trading_algo.quant_core.models.atlas.config_v7 import ATLASv7Config
+
+# Expected trainable-parameter counts per architecture, used by the V1 gate to
+# catch accidental architecture drift.
+_PARAM_TARGETS = {"v1": 766_000, "v7": 492_728}
 
 
 def v1_param_count(model: nn.Module, target: int = 766_000, tolerance: float = 0.15) -> dict:
@@ -104,15 +109,26 @@ def v4_action_bounds(model: nn.Module, config: ATLASConfig, n_trials: int = 10_0
     return {"test": "V4_action_bounds", "passed": violations == 0, "violations": violations, "trials": n_trials}
 
 
-def run_validation_suite(model: nn.Module, config: ATLASConfig | None = None, device: str = "cpu") -> dict:
-    """Run all verification gates. Returns dict with results per gate."""
+def run_validation_suite(
+    model: nn.Module,
+    config: ATLASConfig | ATLASv7Config | None = None,
+    device: str = "cpu",
+    target_params: int | None = None,
+) -> dict:
+    """Run all verification gates. Returns dict with results per gate.
+
+    The architecture is duck-typed from ``config``: v7 configs expect a smaller
+    parameter target than v1. Pass ``target_params`` to override.
+    """
     config = config or ATLASConfig()
+    if target_params is None:
+        target_params = _PARAM_TARGETS["v7" if isinstance(config, ATLASv7Config) else "v1"]
     results = {}
 
     print("Running ATLAS Validation Suite...")
 
     print("  V1: Parameter count...", end=" ")
-    r = v1_param_count(model)
+    r = v1_param_count(model, target=target_params)
     results["V1"] = r
     print(f"{'PASS' if r['passed'] else 'FAIL'} ({r['params']:,} params)")
 

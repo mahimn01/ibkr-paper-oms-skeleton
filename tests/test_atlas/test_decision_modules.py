@@ -25,16 +25,18 @@ class TestDeStationaryModule:
         mod = DeStationaryModule(config)
         mod.eval()
         for _ in range(1000):
+            mu = torch.randn(2, config.context_len, config.n_features)
             sigma = torch.randn(2, config.context_len, config.n_features)
             h = torch.randn(2, config.context_len, config.d_model)
-            tau, _ = mod(sigma, h)
+            tau, _ = mod(mu, sigma, h)
             assert (tau > 0).all(), "tau must be strictly positive"
 
     def test_output_shapes(self, config: ATLASConfig) -> None:
         mod = DeStationaryModule(config)
+        mu = torch.randn(2, config.context_len, config.n_features)
         sigma = torch.randn(2, config.context_len, config.n_features)
         h = torch.randn(2, config.context_len, config.d_model)
-        tau, delta = mod(sigma, h)
+        tau, delta = mod(mu, sigma, h)
         assert tau.shape == (2, config.context_len, 1)
         assert delta.shape == (2, config.context_len, config.d_model)
 
@@ -160,6 +162,7 @@ class TestGradientFlow:
         action_head = ActionHead(config)
 
         # Inputs
+        mu = torch.randn(B, L, config.n_features)
         sigma = torch.randn(B, L, config.n_features)
         h = torch.randn(B, L, config.d_model, requires_grad=True)
         mem_keys = torch.randn(M, config.d_model)
@@ -167,7 +170,7 @@ class TestGradientFlow:
         rtg = torch.randn(B)
 
         # Forward
-        tau, delta = destat(sigma, h)
+        tau, delta = destat(mu, sigma, h)
         s = self_attn(h, tau, delta)
         m, _ = cross_attn(s, mem_keys, mem_values)
         z = fusion(s, m, rtg)
