@@ -49,3 +49,6 @@ checkpoints/
 
 # Claude
 .claude/
+
+# Research data caches
+data/insider_form4_cache/
