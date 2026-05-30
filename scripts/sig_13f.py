@@ -448,26 +448,28 @@ def enumerate_filers(quarters: list[str], *, allow_sec: bool) -> list[int]:
                 out.append(int(p[0].strip()))
         return sorted(set(out))
 
+    # Robust enumeration via EDGAR's quarterly full-index form.idx (lists every
+    # filing of a form type with its CIK), rather than full-text search.
+    import re
     ciks: set[int] = set()
+    seen_yq: set[tuple[int, int]] = set()
     for q in quarters:
-        qe = _q_end(q)
-        start = (qe + timedelta(days=FILING_LAG_DAYS - 30)).isoformat()
-        end = (qe + timedelta(days=120)).isoformat()
-        frm = 0
-        while True:
-            url = ("https://efts.sec.gov/LATEST/search-index"
-                   f"?forms=13F-HR&dateRange=custom&startdt={start}&enddt={end}&from={frm}")
-            data = json.loads(_sec_get(url, allow_sec=allow_sec).decode())
-            hits = data.get("hits", {}).get("hits", [])
-            if not hits:
-                break
-            for h in hits:
-                cik = h.get("_source", {}).get("cik")
-                if cik:
-                    ciks.add(int(str(cik).lstrip("0") or "0"))
-            frm += len(hits)
-            if frm >= min(data.get("hits", {}).get("total", {}).get("value", 0), 9900):
-                break
+        y, qn = int(q[:4]), int(q[-1])
+        if (y, qn) in seen_yq:
+            continue
+        seen_yq.add((y, qn))
+        url = f"https://www.sec.gov/Archives/edgar/full-index/{y}/QTR{qn}/form.idx"
+        try:
+            txt = _sec_get(url, allow_sec=allow_sec).decode("latin-1")
+        except Exception:
+            continue
+        for line in txt.splitlines():
+            if not line.startswith("13F-HR"):
+                continue
+            # CIK is the all-digit token immediately preceding the YYYY-MM-DD date.
+            m = re.search(r"\s(\d{1,10})\s+\d{4}-\d{2}-\d{2}\s", line)
+            if m:
+                ciks.add(int(m.group(1)))
     return sorted(ciks)
 
 
