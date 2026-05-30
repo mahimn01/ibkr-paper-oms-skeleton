@@ -57,8 +57,8 @@ UA = "Mahimn Patel quant research mahimn.patel.k@gmail.com"
 N_NAMES = int(os.environ.get("INSIDER_N_NAMES", "100"))
 DV_LO, DV_HI = 3e5, 1.5e7
 MIN_PRICE = 3.0
-CRAWL_START = date(2018, 1, 1)   # >=3y history before BT_START for routine class.
-BT_START = date(2021, 1, 1)      # backtest window after classification warmup
+CRAWL_START = date.fromisoformat(os.environ.get("INSIDER_CRAWL_START", "2018-01-01"))  # >=3y before BT_START
+BT_START = date.fromisoformat(os.environ.get("INSIDER_BT_START", "2021-01-01"))        # window after classification warmup
 MAX_FILINGS_PER_NAME = int(os.environ.get("INSIDER_MAX_FILINGS", "150"))
 
 
