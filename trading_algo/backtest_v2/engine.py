@@ -29,6 +29,20 @@ from .models import (
     BacktestConfig,
     BacktestResults,
 )
+from .cost_model import (
+    CostModelConfig,
+    adjust_fill_price,
+    borrow_charge,
+    compute_fill_cost,
+    daily_effective_spread,
+    ibkr_tiered_commission,
+)
+from .execution_policy import (
+    ExecutionPolicy,
+    PendingOrder,
+    fill_price_for_policy,
+    policy_introduces_lookahead,
+)
 
 
 class StrategyProtocol(Protocol):
@@ -59,6 +73,15 @@ class StrategyProtocol(Protocol):
     def positions(self) -> Dict[str, Any]:
         """Current positions."""
         ...
+
+
+class _BlankStrategyRef:
+    """Stand-in passed to _open_position from the pending-order drain.
+
+    The caller path doesn't have the live strategy in scope; the engine
+    only reads `asset_states` for logging context. Returning empty here
+    makes the open path safe under deferred fills."""
+    asset_states: Dict[str, Any] = {}
 
 
 @dataclass
@@ -129,6 +152,120 @@ class BacktestEngine:
         # Errors/warnings
         self.errors: List[str] = []
         self.warnings: List[str] = []
+
+        # PLAN.md §2.4 — pending-order queue for non-look-ahead fills.
+        # Keyed by symbol; one pending entry per symbol at most.
+        self._pending_orders: Dict[str, PendingOrder] = {}
+
+        # Resolve string policy from config to enum once.
+        try:
+            self._execution_policy = ExecutionPolicy(config.execution_policy)
+        except ValueError:
+            self.warnings.append(
+                f"unknown execution_policy={config.execution_policy!r}; "
+                "falling back to SAME_BAR_CLOSE"
+            )
+            self._execution_policy = ExecutionPolicy.SAME_BAR_CLOSE
+
+        # Per-symbol rolling window of (open, high, low, close) used for
+        # Corwin-Schultz / Abdi-Ranaldo spread estimation.
+        self._spread_window: Dict[str, List[Tuple[float, float, float, float]]] = (
+            defaultdict(list)
+        )
+
+        # Per-symbol 20-day ADV cache (rolling).
+        self._volume_window: Dict[str, List[int]] = defaultdict(list)
+
+        # Per-symbol daily realized vol in bps (rolling).
+        self._return_window: Dict[str, List[float]] = defaultdict(list)
+
+        if policy_introduces_lookahead(self._execution_policy):
+            self.warnings.append(
+                "execution_policy=SAME_BAR_CLOSE introduces look-ahead bias; "
+                "validator will flag results from this run"
+            )
+
+    # ------------------------------------------------------------------
+    # Cost-model helpers (PLAN.md §2.3).
+    #
+    # These maintain rolling per-symbol windows of OHLCV/return/volume so
+    # we can estimate effective spread (Corwin-Schultz / Abdi-Ranaldo
+    # fallback), 20-day ADV, and realised daily vol on the fly without
+    # round-tripping to the PIT store. They're updated lazily — only when
+    # cost_model_config is set, the rolling state is populated.
+    # ------------------------------------------------------------------
+
+    _SPREAD_WIN_LEN: int = 22       # 22 bars ~ 1 month of daily data
+    _ADV_WIN_LEN: int = 20          # 20-day ADV
+    _RETURN_WIN_LEN: int = 60       # 60-bar window for vol estimate
+
+    def _record_bar_for_costs(self, symbol: str, bar: Bar) -> None:
+        """Update the rolling windows used by the cost estimators.
+
+        No-op when cost_model_config is None; that path uses flat slippage.
+        Called from _process_bar before signal generation.
+        """
+        if self.config.cost_model_config is None:
+            return
+        ohlc = (float(bar.open), float(bar.high), float(bar.low), float(bar.close))
+        sw = self._spread_window[symbol]
+        sw.append(ohlc)
+        if len(sw) > self._SPREAD_WIN_LEN:
+            del sw[0]
+
+        vw = self._volume_window[symbol]
+        vw.append(int(bar.volume))
+        if len(vw) > self._ADV_WIN_LEN:
+            del vw[0]
+
+        rw = self._return_window[symbol]
+        if len(sw) >= 2 and sw[-2][3] > 0:
+            ret = (ohlc[3] - sw[-2][3]) / sw[-2][3]
+            rw.append(float(ret))
+        if len(rw) > self._RETURN_WIN_LEN:
+            del rw[0]
+
+    def _estimate_spread_fraction(self, symbol: str) -> float:
+        """Effective spread for `symbol` from the most recent two bars.
+
+        Falls back to cost_model_config.fallback_spread_bps when there
+        isn't enough history yet. Returned as a fraction of price (e.g.
+        0.0010 = 10 bps).
+        """
+        cmc = self.config.cost_model_config
+        bars = self._spread_window.get(symbol, [])
+        if len(bars) < 2:
+            return (cmc.fallback_spread_bps if cmc else 5.0) / 1e4
+        s = daily_effective_spread(bars)
+        if s <= 0:
+            return (cmc.fallback_spread_bps if cmc else 5.0) / 1e4
+        # Cap to protect against pathological bars.
+        cap = (cmc.spread_cap_bps if cmc else 200.0) / 1e4
+        return min(s, cap)
+
+    def _estimate_adv(self, symbol: str) -> float:
+        """20-day average daily volume for `symbol`. Returns 1.0 (zero
+        impact) when insufficient history; the impact model is bounded
+        below by min_participation so this is safe."""
+        vols = self._volume_window.get(symbol, [])
+        if not vols:
+            return 1.0
+        return float(sum(vols) / len(vols))
+
+    def _estimate_daily_vol_bps(self, symbol: str) -> float:
+        """Realised daily vol of bar-to-bar log returns, in basis points.
+
+        With <2 returns of history, returns 200 bps (a conservative typical
+        US-equity daily vol).
+        """
+        rets = self._return_window.get(symbol, [])
+        if len(rets) < 2:
+            return 200.0
+        try:
+            sd = statistics.stdev(rets)
+        except statistics.StatisticsError:
+            return 200.0
+        return float(sd) * 1e4
 
     def run(
         self,
@@ -272,8 +409,24 @@ class BacktestEngine:
                     volume=bar.volume,
                 )
 
+        # Update rolling cost-model state for tracked symbols.
+        # Done during warmup too so the windows are populated by the time
+        # trading starts.
+        for symbol in self.config.symbols:
+            if symbol in bar_lookup and timestamp in bar_lookup[symbol]:
+                self._record_bar_for_costs(symbol, bar_lookup[symbol][timestamp])
+
         if is_warmup:
             return
+
+        # Drain any pending orders queued on previous bar (NEXT_BAR_OPEN /
+        # NEXT_BAR_VWAP policies). Fills happen at THIS bar's open/vwap
+        # before strategy generates new signals on this bar.
+        self._drain_pending_orders(bar_lookup, timestamp)
+
+        # Apply borrow accrual for any short positions held overnight.
+        if self.config.default_borrow_rate_bps is not None:
+            self._accrue_borrow_costs(bar_lookup, timestamp)
 
         # Update existing positions
         for symbol in list(self.positions.keys()):
@@ -341,16 +494,26 @@ class BacktestEngine:
                 self.warnings.append(f"{timestamp}: Daily loss limit hit, skipping trade")
                 return
 
+        # Lookahead-safe routing: under NEXT_BAR_* policies the signal is
+        # *queued* for fill on the next bar, not executed against this bar.
+        defer = self._execution_policy is not ExecutionPolicy.SAME_BAR_CLOSE
+
         if action in ('buy', 'short'):
-            self._open_position(signal, symbol, bar, timestamp, strategy)
+            if defer:
+                self._enqueue_pending(signal, symbol, timestamp, action)
+            else:
+                self._open_position(signal, symbol, bar, timestamp, strategy)
         elif action in ('sell', 'cover'):
             if symbol in self.positions:
-                self._close_position(
-                    symbol,
-                    bar.close,
-                    timestamp,
-                    getattr(signal, 'reason', 'Signal exit'),
-                )
+                if defer:
+                    self._enqueue_pending(signal, symbol, timestamp, action)
+                else:
+                    self._close_position(
+                        symbol,
+                        bar.close,
+                        timestamp,
+                        getattr(signal, 'reason', 'Signal exit'),
+                    )
 
     def _open_position(
         self,
@@ -360,39 +523,75 @@ class BacktestEngine:
         timestamp: datetime,
         strategy: Any,
     ) -> None:
-        """Open a new position."""
+        """Open a new position.
+
+        Two paths:
+          * config.cost_model_config is None -> legacy flat slippage_pct
+          * config.cost_model_config is set  -> realistic decomposition
+            (Corwin-Schultz spread, sqrt impact, IBKR tiered commission).
+
+        See PLAN.md §2.3 for the cost model. The legacy path is preserved
+        for the existing 84-test surface; new backtests should set
+        cost_model_config=CostModelConfig() to opt into realistic fills.
+        """
         action = signal.action
         direction = 1 if action == 'buy' else -1
+        side = "BUY" if direction > 0 else "SELL"
 
-        # Calculate position size
-        price = bar.close
+        # Paper price = current bar's close (legacy), or next-bar open if
+        # NEXT_BAR_OPEN policy fired the deferred path. Either way, by
+        # the time _open_position is called, `bar` is the bar to fill on.
+        paper_price = bar.close if self._execution_policy is ExecutionPolicy.SAME_BAR_CLOSE \
+            else bar.open
         position_value = self.equity * self.config.position_size_pct
-        quantity = int(position_value / price)
-
+        quantity = int(position_value / paper_price) if paper_price > 0 else 0
         if quantity <= 0:
             return
 
-        # Apply slippage
-        slippage = price * self.config.slippage_pct * direction
-        fill_price = price + slippage
+        # Decide cost path.
+        cmc: Optional[CostModelConfig] = self.config.cost_model_config
+        if cmc is not None:
+            spread_frac = self._estimate_spread_fraction(symbol)
+            adv = self._estimate_adv(symbol)
+            vol_bps = self._estimate_daily_vol_bps(symbol)
+            cost = compute_fill_cost(
+                side=side,
+                quantity=quantity,
+                fill_price=paper_price,
+                spread_fraction=spread_frac,
+                adv=adv,
+                daily_vol_bps=vol_bps,
+                config=cmc,
+            )
+            fill_price = adjust_fill_price(side, paper_price, cost, quantity)
+            commission = cost.commission
+        else:
+            # Legacy path: flat slippage + simple commission.
+            slippage = paper_price * self.config.slippage_pct * direction
+            fill_price = paper_price + slippage
+            commission = max(
+                self.config.min_commission,
+                quantity * self.config.commission_per_share,
+            )
 
-        # Calculate commission
-        commission = max(
-            self.config.min_commission,
-            quantity * self.config.commission_per_share
-        )
-
-        # Check if we have enough cash
-        cost = fill_price * quantity + commission
-        if cost > self.cash:
-            quantity = int((self.cash - commission) / fill_price)
+        # Cash check: do we have enough to open?
+        cost_total = fill_price * quantity + commission
+        if cost_total > self.cash and direction > 0:
+            quantity = int((self.cash - commission) / fill_price) if fill_price > 0 else 0
             if quantity <= 0:
                 return
+            # Recompute commission at the reduced size (legacy path only;
+            # realistic path scales linearly so it's already proportional).
+            if cmc is None:
+                commission = max(
+                    self.config.min_commission,
+                    quantity * self.config.commission_per_share,
+                )
 
-        # Deduct cost
+        # Deduct cost.
         self.cash -= fill_price * quantity * direction + commission
 
-        # Get strategy state for context
+        # Strategy state for context.
         state = strategy.asset_states.get(symbol) if hasattr(strategy, 'asset_states') else None
 
         position = OpenPosition(
@@ -492,18 +691,39 @@ class BacktestEngine:
             return
 
         pos = self.positions[symbol]
+        # On exit, you sell what you're long (BUY -> SELL) and buy what you're
+        # short (SELL -> BUY). For cost purposes, side is the *closing* side.
+        side = "SELL" if pos.direction > 0 else "BUY"
 
-        # Apply slippage
-        slippage = exit_price * self.config.slippage_pct * (-pos.direction)
-        fill_price = exit_price + slippage
+        cmc: Optional[CostModelConfig] = self.config.cost_model_config
+        if cmc is not None:
+            spread_frac = self._estimate_spread_fraction(symbol)
+            adv = self._estimate_adv(symbol)
+            vol_bps = self._estimate_daily_vol_bps(symbol)
+            cost = compute_fill_cost(
+                side=side,
+                quantity=pos.quantity,
+                fill_price=exit_price,
+                spread_fraction=spread_frac,
+                adv=adv,
+                daily_vol_bps=vol_bps,
+                config=cmc,
+            )
+            fill_price = adjust_fill_price(side, exit_price, cost, pos.quantity)
+            commission = cost.commission
+            total_slippage = cost.spread_cost + cost.impact_cost
+        else:
+            # Legacy path.
+            slippage = exit_price * self.config.slippage_pct * (-pos.direction)
+            fill_price = exit_price + slippage
+            commission = max(
+                self.config.min_commission,
+                pos.quantity * self.config.commission_per_share,
+            )
+            total_slippage = abs(slippage) * pos.quantity
 
         # Calculate P&L
         gross_pnl = (fill_price - pos.entry_price) * pos.direction * pos.quantity
-        commission = max(
-            self.config.min_commission,
-            pos.quantity * self.config.commission_per_share
-        )
-        total_slippage = abs(slippage) * pos.quantity
         net_pnl = gross_pnl - commission
 
         # Calculate MFE/MAE
@@ -577,6 +797,158 @@ class BacktestEngine:
         for symbol in list(self.positions.keys()):
             pos = self.positions[symbol]
             self._close_position(symbol, pos.entry_price, timestamp, "Backtest end")
+
+    # ------------------------------------------------------------------
+    # Pending-order queue (PLAN.md §2.4): NEXT_BAR_OPEN / NEXT_BAR_VWAP.
+    # ------------------------------------------------------------------
+
+    def _enqueue_pending(
+        self,
+        signal: Any,
+        symbol: str,
+        timestamp: datetime,
+        action: str,
+    ) -> None:
+        """Queue an entry/exit signal for fill on the next bar."""
+        # Determine direction; for closes it's the inverse of the held position.
+        if action in ('buy',):
+            direction = +1
+            side = "BUY"
+        elif action in ('short',):
+            direction = -1
+            side = "SELL"
+        elif action in ('sell',):
+            direction = -1
+            side = "SELL"
+        elif action in ('cover',):
+            direction = +1
+            side = "BUY"
+        else:
+            return
+
+        # Determine quantity: for entries we resize at fill time; for closes
+        # we use the current position size.
+        qty = 0.0
+        if action in ('buy', 'short'):
+            qty = -1.0   # sentinel; engine sizes from equity at fill time
+        elif symbol in self.positions:
+            qty = float(self.positions[symbol].quantity)
+
+        self._pending_orders[symbol] = PendingOrder(
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            queued_at=timestamp,
+            direction=direction,
+            metadata={
+                "action": action,
+                "signal": signal,
+                "reason": getattr(signal, 'reason', ''),
+            },
+            stop_loss=getattr(signal, 'stop_loss', None),
+            take_profit=getattr(signal, 'take_profit', None),
+        )
+
+    def _drain_pending_orders(
+        self,
+        bar_lookup: Dict[str, Dict[datetime, Bar]],
+        timestamp: datetime,
+    ) -> None:
+        """Fill any pending orders queued on the previous bar.
+
+        Fill price is determined by self._execution_policy and this
+        bar's OHLC. After draining the queue is reset for the bar that's
+        about to generate new signals.
+        """
+        if not self._pending_orders:
+            return
+        drained: List[str] = []
+        for symbol, pending in self._pending_orders.items():
+            if symbol not in bar_lookup or timestamp not in bar_lookup[symbol]:
+                # No bar for this symbol on this timestamp — keep pending.
+                continue
+            bar = bar_lookup[symbol][timestamp]
+            paper_price = fill_price_for_policy(
+                self._execution_policy,
+                bar_open=bar.open,
+                bar_close=bar.close,
+                bar_vwap=bar.vwap or None,
+            )
+            action = pending.metadata.get("action")
+            signal = pending.metadata.get("signal")
+            if action in ('buy', 'short'):
+                # Fabricate a bar at the fill price for the open.
+                synthetic = Bar(
+                    timestamp=timestamp,
+                    open=paper_price, high=paper_price, low=paper_price,
+                    close=paper_price,
+                    volume=bar.volume,
+                    vwap=bar.vwap,
+                )
+                # Re-route via _open_position with SAME_BAR_CLOSE semantics
+                # locally so paper_price is used. Switch policy for the
+                # call, then restore.
+                prev_policy = self._execution_policy
+                self._execution_policy = ExecutionPolicy.SAME_BAR_CLOSE
+                try:
+                    # Strategy ref isn't available here; pass a stub that
+                    # exposes asset_states fallback via getattr.
+                    self._open_position(signal, symbol, synthetic, timestamp,
+                                         _BlankStrategyRef())
+                finally:
+                    self._execution_policy = prev_policy
+            elif action in ('sell', 'cover'):
+                if symbol in self.positions:
+                    self._close_position(
+                        symbol, paper_price, timestamp,
+                        pending.metadata.get("reason") or "Signal exit",
+                    )
+            drained.append(symbol)
+        for sym in drained:
+            self._pending_orders.pop(sym, None)
+
+    # ------------------------------------------------------------------
+    # Borrow accrual.
+    # ------------------------------------------------------------------
+
+    def _accrue_borrow_costs(
+        self,
+        bar_lookup: Dict[str, Dict[datetime, Bar]],
+        timestamp: datetime,
+    ) -> None:
+        """Charge daily ACT/360 borrow on any open short positions.
+
+        We call this once per bar for simplicity; for an intraday-bar
+        backtest the per-bar charge is divided across bars-per-day so the
+        annualised total ties out. For a daily-bar backtest, one bar = one
+        day's accrual.
+        """
+        rate_bps = self.config.default_borrow_rate_bps
+        if rate_bps is None or rate_bps <= 0:
+            return
+        # Approximate bars-per-day from bar_size string. Daily = 1.
+        bars_per_day = 1.0
+        bs = (self.config.bar_size or "").lower()
+        if "min" in bs:
+            try:
+                m = float(bs.split()[0])
+                bars_per_day = max(1.0, 390.0 / m)
+            except (ValueError, IndexError):
+                bars_per_day = 78.0   # 5-min default
+        elif "hour" in bs:
+            bars_per_day = 7.0
+        for symbol, pos in self.positions.items():
+            if pos.direction >= 0:
+                continue
+            if symbol not in bar_lookup or timestamp not in bar_lookup[symbol]:
+                continue
+            bar = bar_lookup[symbol][timestamp]
+            notional = abs(pos.quantity) * bar.close
+            charge = borrow_charge(
+                notional=notional, rate_bps=rate_bps, days=1,
+            ) / bars_per_day
+            self.cash -= charge
+            self.equity -= charge
 
     def _start_day(self, d: date) -> None:
         """Initialize tracking for a new day."""

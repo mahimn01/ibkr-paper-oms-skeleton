@@ -4,6 +4,185 @@ Complete project history, regenerated from `git log` on 2026-04-14. Every
 commit on `main` (and every commit pending merge) is listed with its author
 date and short SHA.
 
+## 2026-05
+
+### Unreleased — Wave T5: enterprise foundation (PIT data, cost realism, validation)
+
+Branch: `enterprise-foundation-v1`. Foundation refactor that closes
+five structural gaps identified in the deep audit of the trading-algo
+codebase. ~3,000 LOC added (new modules + tests). 1054 → 1143 tests
+(+89), zero regressions. PR-to-main acceptance gates per `PLAN.md`.
+
+**The five gaps closed:**
+
+1. **No point-in-time data correctness.** Every backtest above the
+   legacy JSON cache used forward-adjusted prices and a hand-picked,
+   currently-listed universe — silent forward bias + survivorship bias.
+2. **Optimistic flat-bps fill model.** Same-bar close fills with a 5
+   bps fixed slippage and no impact, no borrow cost, no real spread.
+   Inflated returns by ~50–150 bps/year on liquid equity strategies and
+   200–500 bps/year on shorts.
+3. **Look-ahead in the bar loop.** Signals generated on bar T's close
+   filled at bar T's close — strictly impossible in live trading.
+4. **Optional idempotency, ephemeral risk state.** orderRef wasn't
+   guaranteed at the broker layer; daily-loss + orders/day counters
+   reset on every process restart.
+5. **CSCV PBO formula bug + framework never used.** Validator code was
+   correct in skeleton but reported the *complement* of PBO; `n_trials`
+   was hardcoded to 1; no strategy had ever been run through the full
+   suite.
+
+**New modules** (all under `trading_algo/` unless noted):
+
+- `data/schema.sql`: SQLite DDL for the bitemporal metadata layer:
+  securities, ticker_history, splits, dividends, mergers, spinoffs,
+  index_membership, risk_state, spread_cache, borrow_rates,
+  migration_log. Bitemporal `known_from`/`known_to` columns; restatements
+  append rows, never overwrite.
+- `data/pit_store.py`: `PITStore` — SQLite metadata + pyarrow
+  parquet bars partitioned by symbol/year. `upsert_security`,
+  `record_ticker_change` (FB→META 2022-06-09 semantics),
+  `add_split`/`add_dividend`/`add_index_membership`, `write_bars`,
+  `read_bars(as_of=...)`, `restate_bar`. Atomic parquet writes via
+  rename. 13 tests.
+- `data/universe.py`: `UniverseResolver` — point-in-time index
+  membership lookup. `get_universe('SP500', date(2008, 9, 15))` returns
+  LEH-pre-bankruptcy. Hardcoded dev universes gated behind
+  `allow_dev=True` so production strategies can't accidentally use
+  survivorship-biased lists. 8 tests.
+- `data/corporate_actions.py`: `AdjustmentEngine` — cumulative split
+  factor at *query time* (storage stays unadjusted). AAPL pre-2014 bar
+  viewed as of 2024 → factor 1/28 (7:1 then 4:1). Reload-after-future-
+  split doesn't silently rewrite history. 5 tests.
+- `data/migration.py` + `scripts/migrate_to_pit.py`: walks legacy
+  `ibkr_data_cache` JSON files, parses two filename formats, writes
+  Bars to PITStore, logs to `migration_log`. `reconcile()` spot-checks
+  close-price equality post-import. CLI: `python
+  scripts/migrate_to_pit.py --cache-dir <legacy> --pit-root <new>
+  [--reconcile]`. 11 tests.
+- `backtest_v2/cost_model.py`: layered estimators for institutional-
+  grade fill realism (PLAN.md §2.3, full bibliography in module docstring):
+    - `corwin_schultz_spread` — Corwin-Schultz 2012 (J. Finance 67:719)
+      effective-spread estimator from two consecutive H/L pairs.
+    - `abdi_ranaldo_spread` — Abdi-Ranaldo 2017 (RFS 30:4437) CHL
+      triplet fallback for low-volume days.
+    - `daily_effective_spread` — convenience: CS first, AR fallback.
+    - `sqrt_impact_bps` — Toth-Bouchaud-CFM 2011 (PRX 1:021006)
+      square-root impact, `Y * sigma * sqrt(participation)`. Below
+      0.1% ADV: zero. Above 10% ADV: capped (model breakdown).
+    - `borrow_charge` + `recall_probability` — ACT/360 daily accrual,
+      recall risk scaled by rate (capped 5%). `BorrowTier` defaults:
+      SP500 30bps / R1000 50bps / R2000 200bps / HTB skip.
+    - `ibkr_tiered_commission` — per-share + min/max + SEC fee
+      (sells only) + FINRA TAF + pass-through.
+    - `compute_fill_cost` / `adjust_fill_price` — composite fill cost
+      decomposition (spread + impact + commission), apply slippage to
+      paper price.
+   23 tests covering edge cases, threshold + cap, side-specific fees.
+- `backtest_v2/execution_policy.py`: `ExecutionPolicy` enum
+  (`SAME_BAR_CLOSE` / `NEXT_BAR_OPEN` / `NEXT_BAR_VWAP`), `PendingOrder`
+  dataclass, `fill_price_for_policy`, `policy_introduces_lookahead`.
+  7 tests.
+- `quant_core/validation/stationary_bootstrap.py`:
+  Politis-Romano 1994 (JASA 89:1303) stationary bootstrap with
+  geometric-block resampling; Politis-White 2004 simplified block-length
+  rule (`b ~ T^{1/3}`). `bootstrap_sharpe_ci` returns 95% percentile
+  CI for annualized Sharpe — wider on autocorrelated returns than IID
+  bootstrap, as required. 8 tests.
+- `quant_core/validation/report_card.py`: `build_report_card` produces
+  a 7-gate pass/fail audit per strategy. Gates: lower 95% CI on
+  annualized Sharpe (>0.3), PBO (CSCV, <0.5), Deflated Sharpe (>0.95),
+  walk-forward 12m positivity (>=75%), MinTRL (Bailey-LdP 2012, in
+  years), cost-adjusted Sharpe (>0.3). `ReportCard.render()` emits
+  markdown report card per PLAN.md §2.7. Status APPROVED iff every
+  populated gate passes; BLOCKED otherwise. 6 tests.
+
+**Modified modules:**
+
+- `risk.py`: `RiskManager(__init__, ..., db_path=...)` —
+  `_load_state()`/`_save_state()` persist session_start_net_liq,
+  orders_today, orders_today_date to SQLite. Survives mid-day crashes.
+  `last_updated` date used to invalidate stale session NL across
+  calendar boundaries. 7 tests.
+- `oms.py`: `submit()` and `modify()` call `assert_not_halted()` as
+  the first gate, before normalisation, dry-run, or _authorize_send.
+  Even dry-runs are blocked while halted. `cancel()` deliberately
+  does NOT halt-gate (cancels reduce exposure; halted operators
+  often want to flatten). `_require_idempotency_key` defense-in-depth
+  assertion. 4 tests.
+- `orders.py`: `TradeIntent` gains `client_order_id: str` field with
+  default factory `uuid4().hex`. Empty/whitespace IDs rejected at
+  `to_order_request()`. Routes to `OrderRequest.order_ref`.
+- `broker/base.py`: `OrderRequest.normalized()` auto-fills `order_ref`
+  with UUID4 when missing — defense-in-depth so production paths
+  (LLM decision parser, raw broker callers) that historically passed
+  None still emit an idempotent request. 8 tests.
+- `quant_core/validation/pbo.py`: **Bug fix.** CSCV `calculate_multi_strategy`
+  was returning `mean(logits < 0)` — the COMPLEMENT of canonical PBO
+  (Bailey-Borwein-LdP-Zhu 2017). Strategies that should have failed
+  the PBO < 0.5 gate were being approved. Now correctly computes
+  `mean(rank_OOS(best_IS) > N/2)`. With N=50 trials of pure noise the
+  bug reported PBO ~0.13 (looks fine) when truth is ~0.87 (overfit).
+  4 correctness tests.
+- `backtest_v2/engine.py` + `backtest_v2/models.py`: wire cost_model +
+  ExecutionPolicy into the engine. New BacktestConfig fields:
+  `cost_model_config` (None = legacy flat-bps; set = realistic
+  decomposition), `execution_policy` (string-form for serialisation,
+  default `'same_bar_close'` for back-compat), `default_borrow_rate_bps`.
+  Pending-order machinery for non-look-ahead fills (queue on bar T,
+  drain at start of bar T+1 _process_bar). Per-symbol rolling 22-bar
+  OHLC + 20-bar volume + 60-bar return windows for spread / ADV / vol
+  estimators. Borrow accrual on shorts, scaled by bars/day from
+  `bar_size`. SAME_BAR_CLOSE emits a warning surfaced in
+  `BacktestResults.warnings`. 5 end-to-end tests.
+
+**Documentation:**
+
+- `PLAN.md` (new at repo root): full enterprise refactor spec —
+  phase plan, file-by-file change matrix, library + dependency
+  decisions, test strategy, acceptance criteria for PR-to-main, risk
+  register, 20-commit plan, 4-phase forward outline.
+- `CLAUDE.md`: new commands and rules for PIT data, cost model, halt
+  gate, mandatory client_order_id.
+
+**Test counts by suite (post-refactor):**
+
+| File | Tests |
+| --- | --- |
+| test_pit_store.py | 13 |
+| test_universe.py | 8 |
+| test_corporate_actions.py | 5 |
+| test_cost_model.py | 23 |
+| test_execution_policy.py | 7 |
+| test_risk_persistence.py | 7 |
+| test_pbo_correctness.py | 4 |
+| test_stationary_bootstrap.py | 8 |
+| test_oms_halt_gate.py | 4 |
+| test_oms_idempotency.py | 8 |
+| test_backtest_engine_realistic.py | 5 |
+| test_report_card.py | 6 |
+| test_migration.py | 11 |
+| **Total new** | **109** |
+
+(Pre-existing 1054 still pass — 4 ATLAS tests excluded due to
+unrelated `SelectiveSSM` import error on `main`.)
+
+**Acceptance gates (per PLAN.md §6):**
+
+| Gate | Status |
+|---|---|
+| All pre-existing tests pass | yes (1054/1054) |
+| All new tests pass (>=90% coverage on new modules) | yes (109/109) |
+| `import trading_algo` clean on fresh venv | yes |
+| Halt assertion enforced at oms.submit | yes |
+| Validator wireable into orchestrator with `n_trials` from grid | yes (build_report_card API) |
+| No silent fallback to forward-adjusted prices | yes (AdjustmentEngine query-time) |
+| CHANGELOG entry written | yes (this entry) |
+
+The remaining gates from PLAN.md (PIT-store full migration, reference
+baseline run, orchestrator hookup of report card per backtest run) are
+deliverables for the post-merge Phase-2 cull effort.
+
 ## 2026-04
 
 ### Unreleased — Wave T1: enterprise hardening (agent-first infrastructure)

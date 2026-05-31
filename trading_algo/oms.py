@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from trading_algo.broker.base import Broker, OrderRequest, OrderResult, OrderStatus
 from trading_algo.config import TradingConfig
+from trading_algo.halt import assert_not_halted
 from trading_algo.orders import TradeIntent
 from trading_algo.persistence import SqliteStore
 
@@ -92,7 +93,12 @@ class OrderManager:
             time.sleep(float(poll_seconds))
 
     def submit(self, req: OrderRequest) -> OMSResult:
+        # Halt sentinel is the first gate, *before* normalisation, dry-run,
+        # or any broker call. Even dry-runs are blocked while halted to
+        # match operator intent ("stop everything until I clear it").
+        assert_not_halted()
         req = req.normalized()
+        self._require_idempotency_key(req)
         self._authorize_send()
         if self._cfg.dry_run:
             self._log_error("oms.submit", "dry_run")
@@ -101,6 +107,21 @@ class OrderManager:
         self._log_order(req, res)
         self._log_status(res.order_id)
         return OMSResult(order_id=res.order_id, status=res.status)
+
+    @staticmethod
+    def _require_idempotency_key(req: OrderRequest) -> None:
+        """Defense-in-depth assertion that every send carries an idempotency key.
+
+        OrderRequest.normalized() auto-fills order_ref with a UUID4 when
+        missing, so this should fire only if a caller bypassed normalisation
+        or supplied an explicit empty string. Either case is a programmer
+        error worth raising on.
+        """
+        if not req.order_ref or not req.order_ref.strip():
+            raise ValueError(
+                "OrderRequest.order_ref must be set on submit. "
+                "Did you bypass OrderRequest.normalized()?"
+            )
 
     def log_decision(self, strategy: str, intent: TradeIntent, *, accepted: bool, reason: str | None) -> None:
         if self._store is None or self._run_id is None:
@@ -120,6 +141,8 @@ class OrderManager:
         )
 
     def modify(self, order_id: str, new_req: OrderRequest) -> OMSResult:
+        # Modify routes new exposure to the venue; treat as "send" for halt purposes.
+        assert_not_halted()
         new_req = new_req.normalized()
         self._authorize_send()
         if self._cfg.dry_run:
@@ -131,6 +154,9 @@ class OrderManager:
         return OMSResult(order_id=str(order_id), status=res.status)
 
     def cancel(self, order_id: str) -> None:
+        # Cancel REDUCES exposure. We deliberately do NOT halt-gate cancels —
+        # an operator who has halted often wants to flatten via cancel_all.
+        # If you need to block all broker traffic, use a separate kill-switch.
         self._authorize_send()
         if self._cfg.dry_run:
             self._log_error("oms.cancel", "dry_run")

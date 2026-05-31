@@ -466,6 +466,27 @@ class BacktestConfig:
     fill_on_close: bool = False  # Fill at close vs next open
     allow_shorting: bool = True
 
+    # Realistic execution v2 (PLAN.md §2.3-2.4).
+    # When set, the engine uses Corwin-Schultz spread + sqrt impact +
+    # IBKR tiered commission instead of the flat slippage_pct above.
+    # When None, legacy flat-bps slippage is used (backwards-compatible).
+    cost_model_config: Optional[Any] = None  # CostModelConfig | None
+    """If supplied, replaces the flat slippage_pct + commission_per_share
+    pair with a realistic decomposed fill: half-spread (CS+AR fallback),
+    square-root impact, IBKR tiered commission. See cost_model.py."""
+
+    # ExecutionPolicy: bar T signal -> fill where?
+    #   "same_bar_close": legacy (look-ahead)
+    #   "next_bar_open":  signal queued on T, fill at T+1 open  (recommended)
+    #   "next_bar_vwap":  signal queued on T, fill at T+1 VWAP
+    execution_policy: str = "same_bar_close"
+    """String form so configs serialise cleanly. Convert to ExecutionPolicy
+    enum in engine code."""
+
+    # Borrow cost for shorts. None disables; when set, applies daily
+    # ACT/360 accrual on short notional.
+    default_borrow_rate_bps: Optional[float] = None
+
     # Risk
     max_daily_loss_pct: float = 0.05  # 5% daily loss limit
     max_drawdown_pct: float = 0.20   # 20% max drawdown

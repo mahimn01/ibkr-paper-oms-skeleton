@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -19,6 +20,11 @@ class OrderRequest:
     good_till_date: str | None = None  # IBKR GTD format string
     account: str | None = None
     order_ref: str | None = None
+    """Venue-side idempotency key (IBKR `orderRef`). If omitted at
+    construction, `normalized()` auto-fills a UUID4 hex string so every
+    order that reaches a broker has an idempotency handle. To get a
+    *deterministic* (content-addressed) key, derive one yourself via
+    `idempotency.derive_order_ref(intent)`."""
     oca_group: str | None = None
     transmit: bool = True
 
@@ -27,6 +33,11 @@ class OrderRequest:
         side = self.side.strip().upper()
         order_type = self.order_type.strip().upper()
         tif = self.tif.strip().upper()
+        # Auto-fill order_ref if missing. We never let an order without
+        # an idempotency key reach the broker.
+        ref = self.order_ref.strip() if self.order_ref else ""
+        if not ref:
+            ref = uuid.uuid4().hex
         return OrderRequest(
             instrument=instrument,
             side=side,
@@ -38,7 +49,7 @@ class OrderRequest:
             outside_rth=bool(self.outside_rth),
             good_till_date=(self.good_till_date.strip() if self.good_till_date else None),
             account=(self.account.strip() if self.account else None),
-            order_ref=(self.order_ref.strip() if self.order_ref else None),
+            order_ref=ref,
             oca_group=(self.oca_group.strip() if self.oca_group else None),
             transmit=bool(self.transmit),
         )

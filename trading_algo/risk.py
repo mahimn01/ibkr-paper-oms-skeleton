@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import logging
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from typing import Callable
 
 from trading_algo.broker.base import AccountSnapshot, Broker, MarketDataSnapshot, Position
 from trading_algo.instruments import InstrumentSpec, validate_instrument
 from trading_algo.orders import TradeIntent
+
+log = logging.getLogger(__name__)
 
 
 class RiskViolation(ValueError):
@@ -60,12 +65,38 @@ def _instrument_key(inst: InstrumentSpec) -> tuple[str, str]:
 
 
 class RiskManager:
-    def __init__(self, limits: RiskLimits) -> None:
+    """Pre-trade risk gate.
+
+    Persistence (PLAN.md §2.6):
+        Pass `db_path` (a SQLite file path) and the manager will
+        load/save session_start_net_liq, orders_today, and
+        orders_today_date across process restarts. Without it the
+        counters reset on every start and the daily-loss circuit
+        breaker never trips after a crash.
+
+        The DB schema lives in trading_algo/data/schema.sql
+        (table risk_state, single row id=1). The init_schema bool
+        controls whether to create the table inline (handy for tests
+        that don't go through the full PIT bootstrap).
+    """
+
+    def __init__(
+        self,
+        limits: RiskLimits,
+        *,
+        db_path: str | Path | None = None,
+        init_schema: bool = True,
+    ) -> None:
         self._limits = limits
         self._session_start_net_liq: float | None = None
         self._orders_today: int = 0
         self._orders_today_date: str | None = None
         self._lock = threading.Lock()
+        self._db_path: str | None = str(db_path) if db_path else None
+        if self._db_path:
+            if init_schema:
+                self._init_schema()
+            self._load_state()
 
     def validate(self, intent: TradeIntent, broker: Broker, get_snapshot: Callable[[InstrumentSpec], MarketDataSnapshot]) -> None:
         intent_inst = validate_instrument(intent.instrument)
@@ -123,6 +154,95 @@ class RiskManager:
         net_liq = account.values.get("NetLiquidation")
         if net_liq is not None and net_liq > 0:
             self._session_start_net_liq = float(net_liq)
+            self._save_state()
+
+    # ------------------------------------------------------------------ persistence
+
+    def _init_schema(self) -> None:
+        """Create the risk_state table if it doesn't exist.
+
+        Idempotent. The data layer's schema.sql also creates this table
+        — having it here lets RiskManager work standalone in tests.
+        """
+        with self._open_db() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS risk_state (
+                    id                       INTEGER PRIMARY KEY CHECK (id = 1),
+                    session_start_net_liq    REAL,
+                    orders_today             INTEGER NOT NULL DEFAULT 0,
+                    orders_today_date        TEXT,
+                    last_updated             TEXT    NOT NULL
+                )
+                """
+            )
+
+    def _open_db(self) -> sqlite3.Connection:
+        assert self._db_path is not None
+        conn = sqlite3.connect(self._db_path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _load_state(self) -> None:
+        """Load persisted state. Resets orders_today if the date has rolled over."""
+        if self._db_path is None:
+            return
+        try:
+            with self._open_db() as conn:
+                row = conn.execute(
+                    """
+                    SELECT session_start_net_liq, orders_today, orders_today_date,
+                           last_updated
+                    FROM risk_state WHERE id = 1
+                    """
+                ).fetchone()
+            if row is None:
+                return
+            ssnl, ot, otd, last_updated = row
+            today = time.strftime("%Y-%m-%d", time.localtime())
+            # last_updated is "YYYY-MM-DDTHH:MM:SS"; first 10 chars = date.
+            last_date = (last_updated or "")[:10]
+
+            # Daily-orders counter: only carry if otd matches today.
+            if otd == today:
+                self._orders_today = int(ot or 0)
+                self._orders_today_date = otd
+            else:
+                self._orders_today = 0
+                self._orders_today_date = None
+
+            # Session NL: only carry if it was last updated today.
+            if last_date == today and ssnl is not None:
+                self._session_start_net_liq = float(ssnl)
+        except sqlite3.DatabaseError as exc:
+            log.warning("RiskManager._load_state failed: %s", exc)
+
+    def _save_state(self) -> None:
+        """Persist current state to SQLite. Called inside the threading lock."""
+        if self._db_path is None:
+            return
+        try:
+            with self._open_db() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO risk_state
+                      (id, session_start_net_liq, orders_today, orders_today_date, last_updated)
+                    VALUES (1, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      session_start_net_liq = excluded.session_start_net_liq,
+                      orders_today          = excluded.orders_today,
+                      orders_today_date     = excluded.orders_today_date,
+                      last_updated          = excluded.last_updated
+                    """,
+                    (
+                        self._session_start_net_liq,
+                        self._orders_today,
+                        self._orders_today_date,
+                        time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                    ),
+                )
+        except sqlite3.DatabaseError as exc:
+            log.warning("RiskManager._save_state failed: %s", exc)
 
     def _check_max_loss_per_trade(
         self, intent: TradeIntent, entry_price: float, delta: float
@@ -177,6 +297,7 @@ class RiskManager:
                     f"for {today}"
                 )
             self._orders_today += 1
+            self._save_state()
 
     @property
     def orders_today_count(self) -> int:

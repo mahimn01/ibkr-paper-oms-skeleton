@@ -243,13 +243,25 @@ class PBOCalculator:
             best_is_perf = is_perf[best_is_idx]
             best_oos_perf = oos_perf[best_is_idx]
 
-            # Calculate ranks
-            is_rank = n_strategies - np.argsort(np.argsort(is_perf))[best_is_idx]
-            oos_rank = n_strategies - np.argsort(np.argsort(oos_perf))[best_is_idx]
-
-            # Logit: log(relative rank OOS / relative rank IS)
-            omega = oos_rank / n_strategies
-            logit = np.log(omega / (1 - omega + 1e-10))
+            # OOS rank of the IS-winner among the N strategies. Convention
+            # (Bailey, Borwein, Lopez de Prado, Zhu 2017):
+            #     omega = rank_OOS(best_IS) / (N + 1)        in (0, 1)
+            #     logit = log(omega / (1 - omega))
+            #     PBO  = P(rank_OOS(best_IS) > N/2)
+            #          = P(omega > 0.5)
+            #          = P(logit > 0)
+            # Earlier code returned `mean(logit < 0)` (the inverse) which
+            # systematically *under*-reported PBO. Fixed below.
+            #
+            # `argsort(argsort(x))[i]` returns the 0-indexed rank of x[i]
+            # in ascending order. We want descending order (best=rank 1),
+            # so subtract from N.
+            oos_rank_desc = n_strategies - np.argsort(np.argsort(oos_perf))[best_is_idx]
+            omega = oos_rank_desc / (n_strategies + 1)
+            # Clip omega to (eps, 1-eps) so logit is finite.
+            eps = 1e-10
+            omega = float(min(max(omega, eps), 1.0 - eps))
+            logit = float(np.log(omega / (1.0 - omega)))
 
             logits.append(logit)
             is_performances.append(best_is_perf)
@@ -259,10 +271,10 @@ class PBOCalculator:
         is_performances = np.array(is_performances)
         oos_performances = np.array(oos_performances)
 
-        # PBO = P(w* <= 0.5) where w* is relative OOS rank
-        # Approximated by fraction of negative logits
-        pbo = np.mean(logits < 0)
-        pbo_std = np.std(logits < 0) / np.sqrt(len(logits))
+        # Canonical PBO: probability the IS winner is in the *bottom half*
+        # of OOS ranks. omega > 0.5  <=>  logit > 0.
+        pbo = float(np.mean(logits > 0))
+        pbo_std = float(np.std(logits > 0)) / float(np.sqrt(len(logits)))
 
         # Rank correlation
         rank_corr, _ = stats.spearmanr(is_performances, oos_performances)
