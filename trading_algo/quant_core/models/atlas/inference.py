@@ -9,9 +9,28 @@ import numpy as np
 import torch
 
 from trading_algo.quant_core.models.atlas.config import ATLASConfig
+from trading_algo.quant_core.models.atlas.config_v7 import ATLASv7Config
 from trading_algo.quant_core.models.atlas.model import ATLASModel
+from trading_algo.quant_core.models.atlas.model_v7 import ATLASModelV7
 from trading_algo.quant_core.models.atlas.features import ATLASFeatureComputer, RollingNormalizer
 from trading_algo.quant_core.models.atlas.execution_bridge import TradeDecision, action_to_trade
+
+# v7-only config keys, used to disambiguate dict-serialized configs from older
+# checkpoints that didn't store a config instance.
+_V7_CONFIG_KEYS = frozenset(
+    {"head_dim", "n_mlstm_layers", "n_transformer_layers", "patch_size", "n_regimes"}
+)
+
+
+def _is_v7_config(config: object) -> bool:
+    """True if a checkpoint's stored config describes the v7 architecture."""
+    if isinstance(config, ATLASv7Config):
+        return True
+    if isinstance(config, ATLASConfig):
+        return False
+    if isinstance(config, dict):
+        return bool(_V7_CONFIG_KEYS & config.keys())
+    return False
 
 
 class ATLASInference:
@@ -27,12 +46,12 @@ class ATLASInference:
         )
     """
 
-    def __init__(self, model: ATLASModel, config: ATLASConfig, device: str = "cpu"):
+    def __init__(self, model: ATLASModel | ATLASModelV7, config: ATLASConfig | ATLASv7Config, device: str = "cpu"):
         self.model = model.to(device).eval()
         self.config = config
         self.device = device
         self.feature_computer = ATLASFeatureComputer()
-        self.normalizer = RollingNormalizer(lookback=252)
+        self.normalizer = RollingNormalizer()  # lookback is a normalize() arg (default 252)
 
         self._closes: deque[float] = deque(maxlen=400)
         self._highs: deque[float] = deque(maxlen=400)
@@ -43,11 +62,42 @@ class ATLASInference:
     @classmethod
     def from_checkpoint(cls, path: str, device: str = "cpu") -> "ATLASInference":
         checkpoint = torch.load(path, map_location=device, weights_only=False)
-        config = checkpoint.get("config", ATLASConfig())
-        if isinstance(config, dict):
-            config = ATLASConfig(**config)
-        model = ATLASModel(config)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint["model_state_dict"]
+        stored_config = checkpoint.get("config")
+
+        # The weight names are authoritative for architecture (they are what we
+        # load); revin/patch_embed are v7-only top-level modules. The stored
+        # config only parameterizes the chosen architecture — legacy v1
+        # checkpoints often store no config at all, so we synthesize a default.
+        weights_are_v7 = any(k.startswith(("revin.", "patch_embed.")) for k in state_dict)
+
+        if stored_config is not None and _is_v7_config(stored_config) != weights_are_v7:
+            raise ValueError(
+                f"ATLAS checkpoint {path!r} is inconsistent: stored config indicates "
+                f"{'v7' if _is_v7_config(stored_config) else 'v1'} but weights indicate "
+                f"{'v7' if weights_are_v7 else 'v1'}."
+            )
+
+        config: ATLASConfig | ATLASv7Config
+        model: ATLASModel | ATLASModelV7
+        if weights_are_v7:
+            if isinstance(stored_config, ATLASv7Config):
+                config = stored_config
+            elif isinstance(stored_config, dict):
+                config = ATLASv7Config(**stored_config)
+            else:
+                config = ATLASv7Config()
+            model = ATLASModelV7(config)
+        else:
+            if isinstance(stored_config, ATLASConfig):
+                config = stored_config
+            elif isinstance(stored_config, dict):
+                config = ATLASConfig(**stored_config)
+            else:
+                config = ATLASConfig()
+            model = ATLASModel(config)
+
+        model.load_state_dict(state_dict)
         return cls(model, config, device)
 
     def update_buffer(self, date: datetime, price: float, high: float, low: float, volume: float) -> None:

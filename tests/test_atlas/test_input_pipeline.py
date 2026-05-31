@@ -16,9 +16,8 @@ from trading_algo.quant_core.models.atlas.vsn import (
     VariableSelectionNetwork,
 )
 from trading_algo.quant_core.models.atlas.mamba import (
+    CausalTransformerBlock,
     MambaBackbone,
-    MambaBlock,
-    SelectiveSSM,
 )
 
 
@@ -148,34 +147,22 @@ class TestVariableSelectionNetwork:
 # ─── Mamba ───────────────────────────────────────────────────────────────────
 
 
-class TestSelectiveSSM:
+# The original Mamba SelectiveSSM/MambaBlock were replaced by a causal Transformer
+# block (nn.MultiheadAttention dispatches to Metal kernels on MPS). MambaBlock
+# remains as an alias of CausalTransformerBlock for import compatibility.
+class TestCausalTransformerBlock:
     def test_output_shape(self) -> None:
-        d_inner = 128
-        ssm = SelectiveSSM(d_inner=d_inner, d_state=16, dt_rank=4)
-        x = torch.randn(2, 90, d_inner)
-        out = ssm(x)
-        assert out.shape == (2, 90, d_inner)
-
-    def test_no_nan(self) -> None:
-        ssm = SelectiveSSM(d_inner=128, d_state=16, dt_rank=4)
-        x = torch.randn(2, 90, 128)
-        out = ssm(x)
-        assert not torch.isnan(out).any()
-
-
-class TestMambaBlock:
-    def test_output_shape(self) -> None:
-        block = MambaBlock(d_model=64, d_state=16, d_conv=4, expand_factor=2)
+        block = CausalTransformerBlock(d_model=64, n_heads=4, ffn_mult=4)
         x = torch.randn(2, 90, 64)
         out = block(x)
         assert out.shape == (2, 90, 64)
         assert out.dtype == torch.float32
 
     def test_residual_connection(self) -> None:
-        block = MambaBlock(d_model=64)
+        block = CausalTransformerBlock(d_model=64)
         x = torch.zeros(1, 10, 64)
         out = block(x)
-        # With zero input, output should be close to zero (residual + near-zero processing)
+        # With zero input, output stays bounded (residual + small bias-driven processing)
         assert out.abs().max() < 10.0
 
 
@@ -191,7 +178,7 @@ class TestMambaBackbone:
         """Perturbing input at t=50 should not affect output at t<50."""
         torch.manual_seed(42)
         # Use a single block to test causality clearly (multi-layer attenuates signal)
-        block = MambaBlock(d_model=64, d_state=16, d_conv=4, expand_factor=2)
+        block = CausalTransformerBlock(d_model=64)
         block.eval()
 
         x = torch.randn(1, 90, 64)
@@ -226,8 +213,9 @@ class TestMambaBackbone:
     def test_param_count(self) -> None:
         backbone = MambaBackbone(d_model=64, n_layers=4, d_state=16)
         total = sum(p.numel() for p in backbone.parameters())
-        # Spec says ~65K per backbone. Allow reasonable range.
-        assert 40_000 < total < 200_000, f"Param count {total} outside expected range"
+        # 4× causal Transformer blocks at d_model=64 ≈ 200K params (larger than
+        # the original Mamba backbone's ~65K).
+        assert 150_000 < total < 260_000, f"Param count {total} outside expected range"
 
     def test_gradient_flow(self) -> None:
         backbone = MambaBackbone(d_model=64, n_layers=4, d_state=16)

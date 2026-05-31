@@ -87,19 +87,63 @@ def test_report_card_with_cost_adjusted_returns_blocks_when_unprofitable() -> No
 
 
 def test_report_card_status_approved_when_all_gates_pass() -> None:
-    """Construct a return stream strong enough to pass everything."""
+    """A strong strategy with EVERY required gate present -> APPROVED.
+
+    Must supply trial_grid (PBO) and cost_adjusted_returns (cost gate) or the
+    card is INCOMPLETE, not APPROVED.
+    """
     rng = np.random.default_rng(8)
-    # Use a long, smooth, modestly positive series to clear all gates.
-    rets = rng.normal(loc=0.0010, scale=0.008, size=2_000)
+    T, N = 2_500, 20
+    grid = rng.normal(loc=0.0002, scale=0.008, size=(T, N))  # T x N
+    grid[:, 0] += 0.0010  # the chosen variant carries a persistent edge -> low PBO
+    rets = grid[:, 0]
+    cost_adj = rets - 0.0002  # mild costs; still a strong positive Sharpe
     rc = build_report_card(
         strategy_name="winner",
         returns=rets,
-        n_trials=1,
+        n_trials=N,
+        trial_grid=grid,
+        cost_adjusted_returns=cost_adj,
         bootstrap_resamples=300,
         seed=42,
     )
-    # All populated gates pass -> APPROVED.
     assert rc.status == "APPROVED", rc.render()
+
+
+def test_dsr_gate_is_a_probability_not_a_zscore() -> None:
+    """The Deflated Sharpe gate value must be a probability in [0, 1].
+
+    A marginal edge searched over many trials should NOT clear DSR>0.95 (the
+    old z-score gate passed trivially for any positive Sharpe).
+    """
+    rng = np.random.default_rng(21)
+    rets = rng.normal(loc=0.00035, scale=0.012, size=900)  # ~0.46 annualised Sharpe
+    rc = build_report_card(
+        strategy_name="marginal",
+        returns=rets,
+        n_trials=200,  # heavy multiple testing -> strong deflation
+        bootstrap_resamples=200,
+        seed=3,
+    )
+    dsr_gate = next(g for g in rc.gates if g.name == "Deflated Sharpe")
+    assert 0.0 <= dsr_gate.value <= 1.0, "DSR gate must be a probability"
+    assert dsr_gate.passed is False, "marginal edge over 200 trials must fail DSR"
+
+
+def test_missing_required_gate_is_incomplete_not_approved() -> None:
+    """A strong stream with no trial_grid / cost_adjusted cannot be APPROVED."""
+    rng = np.random.default_rng(8)
+    rets = rng.normal(loc=0.0010, scale=0.008, size=2_000)
+    rc = build_report_card(
+        strategy_name="no_overfit_gate",
+        returns=rets,
+        n_trials=1,
+        bootstrap_resamples=200,
+        seed=42,
+    )
+    assert rc.status == "INCOMPLETE", rc.render()
+    assert "PBO (CSCV)" in rc.missing_required_gates
+    assert "Cost-adjusted Sharpe" in rc.missing_required_gates
 
 
 def test_empty_returns_raises() -> None:
