@@ -34,11 +34,13 @@ class DeStationaryModule(nn.Module):
 
     def forward(
         self,
+        pre_norm_mu: torch.Tensor,
         pre_norm_sigma: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
+            pre_norm_mu: (B, L, n_features) — rolling mean before normalization
             pre_norm_sigma: (B, L, n_features) — rolling std before normalization
             hidden_states: (B, L, d_model) — output from temporal backbone
 
@@ -46,9 +48,12 @@ class DeStationaryModule(nn.Module):
             tau: (B, L, 1) — scaling factor, always positive
             delta: (B, L, d_model) — bias factor
         """
-        # Average across features to get a scalar per timestep
+        # Average across features to get a scalar per timestep. sigma drives the
+        # multiplicative scale (tau); mu drives the additive level-bias (delta),
+        # per Non-stationary Transformers (Liu et al. 2022). Previously delta was
+        # driven by sigma too — a bug that fed level information from the wrong stat.
         sigma_mean = pre_norm_sigma.mean(dim=-1, keepdim=True)  # (B, L, 1)
-        mu_mean = pre_norm_sigma.mean(dim=-1, keepdim=True)  # (B, L, 1)
+        mu_mean = pre_norm_mu.mean(dim=-1, keepdim=True)  # (B, L, 1)
 
         cat_tau = torch.cat([sigma_mean, hidden_states], dim=-1)  # (B, L, d+1)
         tau = torch.exp(self.mlp_tau(cat_tau).clamp(-3, 3))  # (B, L, 1), bounded [e^-3, e^3] ≈ [0.05, 20]

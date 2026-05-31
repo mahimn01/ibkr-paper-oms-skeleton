@@ -49,3 +49,11 @@ checkpoints/
 
 # Claude
 .claude/
+
+# Research data caches
+data/insider_form4_cache/
+data/short_interest_cache/
+data/inst_13f_cache/
+data/pit_pilot/
+data/pit_full/
+logs/
