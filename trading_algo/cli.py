@@ -16,6 +16,7 @@ from trading_algo.instruments import InstrumentSpec, validate_instrument
 from trading_algo.logging_setup import configure_logging
 from trading_algo.orders import TradeIntent
 from trading_algo.persistence import SqliteStore
+from trading_algo.journal_cli import add_journal_subparser
 from trading_algo.strategy.example import ExampleStrategy
 from trading_algo.oms import OrderManager
 from trading_algo.backtest.data import load_bars_csv
@@ -59,6 +60,9 @@ def _make_broker(kind: Literal["ibkr", "sim"], cfg: TradingConfig):
             require_paper=cfg.require_paper,
             allow_live=cfg.allow_live,
             live_confirm_callback=_live_confirm_prompt if cfg.allow_live else None,
+            db_path=cfg.db_path,
+            constitution_required=cfg.constitution_required,
+            constitution_max_age_s=cfg.constitution_max_age_s,
         )
     raise ValueError(f"Unsupported broker: {kind}")
 
@@ -2002,6 +2006,8 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--quiet-ibkr-logs", action="store_true", dest="quiet_ibkr_logs")
     chat.add_argument("--ui", choices=["auto", "plain", "rich", "tui"], default="auto")
     chat.set_defaults(func=_cmd_chat)
+
+    add_journal_subparser(sub)
 
     return p
 
