@@ -169,6 +169,16 @@ class TradingConfig:
     confirm_token_required: bool = False
     db_path: str | None = None
     poll_seconds: int = 5
+    # Pre-transmit constitution gate. OPT-IN: default off everywhere, enabled
+    # only by TRADING_CONSTITUTION_REQUIRED=true. It is NOT auto-coupled to
+    # live_enabled because the verdict-writer (the constitution-check command /
+    # CLI gate) must be wired and paper-verified first — auto-enabling it with no
+    # writer would refuse every live transmit ("no fresh clearance").
+    constitution_required: bool = False
+    # A cleared verdict older than this is stale -> re-check. The verdict is
+    # stamped at enrichment START (data age, honest) and live enrichment takes
+    # ~20-25s over the gateway, so 120s leaves ~90s to review + transmit.
+    constitution_max_age_s: int = 120
     ibkr: IBKRConfig = IBKRConfig()
 
     @staticmethod
@@ -179,9 +189,10 @@ class TradingConfig:
             client_id=_get_env_int("IBKR_CLIENT_ID", 7),
         )
         allow_live = _get_env_bool("TRADING_ALLOW_LIVE", False)
+        live_enabled = _get_env_bool("TRADING_LIVE_ENABLED", False)
         return TradingConfig(
             broker=_get_env("TRADING_BROKER", "ibkr"),
-            live_enabled=_get_env_bool("TRADING_LIVE_ENABLED", False),
+            live_enabled=live_enabled,
             require_paper=not allow_live,
             allow_live=allow_live,
             dry_run=_get_env_bool("TRADING_DRY_RUN", False),
@@ -189,5 +200,7 @@ class TradingConfig:
             confirm_token_required=_get_env_bool("TRADING_CONFIRM_TOKEN_REQUIRED", False),
             db_path=(_get_env("TRADING_DB_PATH", "").strip() or None),
             poll_seconds=_get_env_int("TRADING_POLL_SECONDS", 5),
+            constitution_required=_get_env_bool("TRADING_CONSTITUTION_REQUIRED", False),
+            constitution_max_age_s=_get_env_int("TRADING_CONSTITUTION_MAX_AGE_S", 120),
             ibkr=ibkr,
         )

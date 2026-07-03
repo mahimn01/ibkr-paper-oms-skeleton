@@ -527,6 +527,11 @@ class IBKRBroker:
     optimization_config: IBKROptimizationConfig = field(
         default_factory=IBKROptimizationConfig
     )
+    # Pre-transmit constitution gate (Family A chokepoint). Defaults OFF so
+    # sim/paper/tests are unaffected; threaded on from cfg in cli._make_broker.
+    db_path: str | None = None
+    constitution_required: bool = False
+    constitution_max_age_s: int = 30
 
     # Private fields
     _factories: _Factories | None = field(default=None, init=False, repr=False)
@@ -778,6 +783,29 @@ class IBKRBroker:
         # Timeout - return whatever status we have
         return getattr(trade.orderStatus, "status", "Unknown")
 
+    def _require_constitution_clearance(self, req: OrderRequest) -> None:
+        """Family A chokepoint: covers cli place/modify, engine, and any caller
+        that reaches IBKRBroker. No-op unless constitution_required. Fail-closed."""
+        if not self.constitution_required:
+            return
+        from trading_algo.constitution_clearance import verify_clearance
+        from trading_algo.persistence import SqliteStore
+
+        inst = req.instrument
+        store = SqliteStore(self.db_path) if self.db_path else None
+        try:
+            verify_clearance(
+                store,
+                symbol=inst.symbol, kind=inst.kind, side=req.side, quantity=req.quantity,
+                right=inst.right, strike=inst.strike, expiry=inst.expiry, account=req.account,
+                limit_price=req.limit_price, order_type=req.order_type,
+                required=self.constitution_required, max_age_s=self.constitution_max_age_s,
+                order_ref=req.order_ref,
+            )
+        finally:
+            if store is not None:
+                store.close()
+
     def place_order(self, req: OrderRequest) -> OrderResult:
         """
         Place an order with event-based confirmation.
@@ -793,6 +821,7 @@ class IBKRBroker:
             raise RuntimeError("Broker is not connected")
 
         req = validate_order_request(req)
+        self._require_constitution_clearance(req)
 
         self._require_live_confirmation(
             "PLACE ORDER",
@@ -843,6 +872,7 @@ class IBKRBroker:
             raise RuntimeError("Broker is not connected")
 
         new_req = validate_order_request(new_req)
+        self._require_constitution_clearance(new_req)
 
         self._require_live_confirmation(
             "MODIFY ORDER",
@@ -992,6 +1022,13 @@ class IBKRBroker:
 
         if self._ib is None:
             raise RuntimeError("Broker is not connected")
+
+        # Constitution clearance on the ENTRY leg (the new exposure; TP/SL
+        # children only reduce it). Synthesized as the equivalent OrderRequest.
+        self._require_constitution_clearance(OrderRequest(
+            instrument=req.instrument, side=req.side, quantity=req.quantity,
+            order_type="LMT", limit_price=req.entry_limit_price,
+        ))
 
         self._require_live_confirmation(
             "PLACE BRACKET ORDER",

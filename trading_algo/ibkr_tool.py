@@ -257,7 +257,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
 
 def cmd_values(args: argparse.Namespace) -> int:
     ib = _connect(args)
-    ib.reqAccountUpdates(True, args.account or "")
+    ib.reqAccountUpdates(args.account or "")
     ib.sleep(2.0)
     values = [
         {"account": v.account, "tag": v.tag, "value": v.value, "currency": v.currency, "modelCode": v.modelCode}
@@ -266,7 +266,6 @@ def cmd_values(args: argparse.Namespace) -> int:
     if args.tag:
         values = [v for v in values if args.tag.lower() in v["tag"].lower()]
     _emit(values, args.format)
-    ib.reqAccountUpdates(False, args.account or "")
     ib.disconnect()
     return 0
 
@@ -1115,6 +1114,535 @@ def _wait_for_order_ack(ib: IB, trade: Any, timeout: float = 15.0) -> bool:
     return trade.orderStatus.status not in ("Cancelled", "ApiCancelled", "Inactive")
 
 
+# ============================================================
+# Constitution gate — the verdict WRITER (read-only) + Family B clearance
+# ============================================================
+
+def _connect_readonly(args: argparse.Namespace) -> IB:
+    """Data-only connection for the constitution check: readonly=True means the
+    API session CANNOT transmit orders even by bug."""
+    ib = IB()
+    host = args.host or DEFAULT_HOST
+    port = args.port or DEFAULT_PORT
+    client_id = args.client_id if args.client_id is not None else DEFAULT_CLIENT_ID
+    ib.connect(host, port, clientId=client_id, timeout=args.timeout, readonly=True)
+    ib.reqMarketDataType(args.market_data_type or 1)
+    return ib
+
+
+def _make_usd_rate(ib: IB, *, wait: float = 4.0) -> Callable[[str | None], float | None]:
+    """ccy -> USD conversion via IDEALPRO marks (delayed is fine for ratios).
+    Everything the gate compares against NetLiq is normalized to USD."""
+    cache: dict[str, float | None] = {"USD": 1.0}
+
+    def _pair_mark(pair: str) -> float | None:
+        try:
+            f = Forex(pair)
+            qualified = ib.qualifyContracts(f)
+            if not qualified:
+                return None
+            t = ib.reqMktData(qualified[0], "", False, False)
+            deadline = time.time() + wait
+            px = None
+            while time.time() < deadline:
+                ib.sleep(0.25)
+                px = _safe_num(t.marketPrice()) or _safe_num(t.close)
+                if px is not None:
+                    break
+            ib.cancelMktData(qualified[0])
+            return px
+        except Exception:
+            return None
+
+    def rate(ccy: str | None) -> float | None:
+        c = (ccy or "USD").upper()
+        if c in cache:
+            return cache[c]
+        r = _pair_mark(c + "USD")  # direct (e.g. EURUSD)
+        if r is None:
+            inv = _pair_mark("USD" + c)  # inverse (e.g. USDCAD)
+            r = (1.0 / inv) if inv else None
+        cache[c] = r
+        return r
+
+    return rate
+
+
+def _combined_net_liq_usd(ib: IB, usd_rate) -> float | None:
+    """Combined NetLiquidation across ALL managed accounts, in USD — the
+    constitution's caps are written against the combined family book."""
+    total = 0.0
+    seen = False
+    try:
+        for row in ib.accountSummary():
+            if row.tag != "NetLiquidation":
+                continue
+            try:
+                v = float(row.value)
+            except (TypeError, ValueError):
+                continue
+            r = usd_rate(getattr(row, "currency", "USD"))
+            if r is None:
+                return None  # can't normalize -> unknown (rules SKIP, verdict incomplete)
+            total += v * r
+            seen = True
+    except Exception:
+        return None
+    return total if seen and total > 0 else None
+
+
+def _positions_as_base(ib: IB) -> tuple[list, dict]:
+    """ib.positions() (all accounts) -> (trading_algo Positions, contract map).
+    The map keys each position's OWN qualified-able contract + currency so
+    quoting uses the real listing (VFV=TSE/CAD etc.), never a USD guess."""
+    from trading_algo.broker.base import Position as BasePosition
+    from trading_algo.instruments import InstrumentSpec
+
+    kind_map = {"STK": "STK", "OPT": "OPT", "FUT": "FUT", "CASH": "FX"}
+    out: list = []
+    contract_map: dict = {}
+    for p in ib.positions():
+        c = p.contract
+        kind = kind_map.get(getattr(c, "secType", ""), getattr(c, "secType", "STK"))
+        ccy = (getattr(c, "currency", "") or "USD").upper()
+        sym = c.symbol.upper()
+        expiry = getattr(c, "lastTradeDateOrContractMonth", "") or None
+        right = (getattr(c, "right", "") or "").upper() or None
+        strike = float(c.strike) if getattr(c, "strike", 0) else None
+        if kind == "STK":
+            contract_map[("STK", sym)] = (c, ccy)
+        elif kind == "OPT":
+            contract_map[("OPT", sym, expiry, right, strike)] = (c, ccy)
+        out.append(BasePosition(
+            account=p.account,
+            instrument=InstrumentSpec(
+                kind=kind, symbol=sym, currency=ccy,
+                expiry=expiry, right=right, strike=strike,
+                multiplier=(str(c.multiplier) if getattr(c, "multiplier", "") else None),
+            ),
+            quantity=float(p.position),
+            avg_cost=(float(p.avgCost) if p.avgCost is not None else None),
+            timestamp_epoch_s=time.time(),
+        ))
+    return out, contract_map
+
+
+def _safe_num(v: Any) -> float | None:
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f) or f == -1.0:
+        return None
+    return f
+
+
+def _make_gateway_providers(ib: IB, *, wait: float, contract_map: dict, usd_rate):
+    """greeks/spot providers over the live gateway, USD-normalized. All position
+    contracts are BATCH-prefetched (one subscription sweep, one shared wait) —
+    sequential subscribe/cancel cycles were shown to drop greeks under pacing.
+    The trade's own contract is fetched on demand. Any persistent miss returns
+    None (the adapter marks the verdict incomplete — fail-closed)."""
+    from trading_algo.constitution_adapter import OptionGreeks
+
+    greeks_cache: dict[tuple, OptionGreeks | None] = {}
+    spot_cache: dict[str, float | None] = {}
+
+    def _qualified(c) -> Any | None:
+        try:
+            q = ib.qualifyContracts(c)
+            return q[0] if q else None
+        except Exception:
+            return None
+
+    def _opt_ready(t) -> bool:
+        return bool(t.modelGreeks or t.lastGreeks)
+
+    def _stk_px(t) -> float | None:
+        return _safe_num(t.last) or _safe_num(t.marketPrice()) or _safe_num(t.close)
+
+    def _harvest_opt(t, ccy) -> OptionGreeks | None:
+        g = t.modelGreeks or t.lastGreeks or t.askGreeks or t.bidGreeks
+        r = usd_rate(ccy)
+        if g is None or r is None:
+            return None
+        opt_px = _safe_num(g.optPrice)
+        und_px = _safe_num(g.undPrice)
+        return OptionGreeks(
+            delta=_safe_num(g.delta), iv=_safe_num(g.impliedVol),
+            opt_price=opt_px * r if opt_px is not None else None,
+            und_price=und_px * r if und_px is not None else None,
+            bid=_safe_num(t.bid), ask=_safe_num(t.ask),
+        )
+
+    # ---- batch prefetch of every position contract ----
+    subs: list[tuple[tuple, Any, str, Any]] = []  # (map_key, ticker, ccy, qualified)
+    try:
+        for key, (c, ccy) in contract_map.items():
+            q = _qualified(c)
+            if q is not None:
+                subs.append((key, ib.reqMktData(q, "", False, False), ccy, q))
+        deadline = time.time() + max(wait, 10.0)
+        while time.time() < deadline:
+            ib.sleep(0.3)
+            pending = [
+                s for s in subs
+                if (s[0][0] == "OPT" and not _opt_ready(s[1]))
+                or (s[0][0] == "STK" and _stk_px(s[1]) is None)
+            ]
+            if not pending:
+                break
+        for key, t, ccy, q in subs:
+            if key[0] == "OPT":
+                greeks_cache[key[1:]] = _harvest_opt(t, ccy)
+            else:
+                px = _stk_px(t)
+                r = usd_rate(ccy)
+                spot_cache[key[1]] = px * r if (px is not None and r is not None) else None
+            try:
+                ib.cancelMktData(q)
+            except Exception:
+                pass
+    except Exception:
+        pass  # missing entries stay unfetched -> providers fall back / stay None
+
+    def greeks_provider(spec) -> OptionGreeks | None:
+        key = (spec.symbol.upper(), spec.expiry, (spec.right or "").upper(),
+               float(spec.strike) if spec.strike is not None else None)
+        if key in greeks_cache:
+            return greeks_cache[key]
+        result = None
+        ccy = ((spec.currency or "USD").upper()
+               if getattr(spec, "currency", None) else "USD")
+        q = _qualified(Option(key[0], spec.expiry, key[3], key[2], "SMART", currency=ccy))
+        if q is not None:
+            try:
+                t = ib.reqMktData(q, "", False, False)
+                deadline = time.time() + wait
+                while time.time() < deadline:
+                    ib.sleep(0.25)
+                    if _opt_ready(t):
+                        break
+                result = _harvest_opt(t, ccy)
+                ib.cancelMktData(q)
+            except Exception:
+                result = None
+        greeks_cache[key] = result
+        return result
+
+    def spot_provider(symbol: str) -> float | None:
+        sym = symbol.upper()
+        if sym in spot_cache:
+            return spot_cache[sym]
+        px = None
+        q = _qualified(Stock(sym, "SMART", "USD"))
+        if q is not None:
+            try:
+                t = ib.reqMktData(q, "", False, False)
+                deadline = time.time() + min(wait, 4.0)
+                while time.time() < deadline:
+                    ib.sleep(0.25)
+                    px = _stk_px(t)
+                    if px is not None:
+                        break
+                ib.cancelMktData(q)
+            except Exception:
+                px = None
+        spot_cache[sym] = px
+        return px
+
+    return greeks_provider, spot_provider
+
+
+class _GatewaySnapshotBroker:
+    """Minimal duck-typed broker for build_eval_context: a frozen snapshot of
+    the gateway's account + positions (read-only, no order capability)."""
+
+    def __init__(self, account: str, net_liq: float | None, positions: list) -> None:
+        from trading_algo.broker.base import AccountSnapshot
+        values = {"NetLiquidation": net_liq} if net_liq is not None else {}
+        self._snap = AccountSnapshot(account=account, values=values,
+                                     timestamp_epoch_s=time.time())
+        self._positions = positions
+
+    def get_account_snapshot(self):
+        return self._snap
+
+    def get_positions(self):
+        return self._positions
+
+
+def _parse_legs(spec: str) -> list[tuple[str, int, int]]:
+    """'BUY:conId:ratio,SELL:conId:ratio' -> [(action, conId, ratio), ...]"""
+    legs: list[tuple[str, int, int]] = []
+    for leg_spec in spec.split(","):
+        parts = leg_spec.strip().split(":")
+        if len(parts) != 3:
+            raise SystemExit(f"bad leg spec '{leg_spec}' (want ACTION:conId:ratio)")
+        action, con_id, ratio = parts
+        action = action.upper()
+        if action not in {"BUY", "SELL"}:
+            raise SystemExit(f"bad leg action '{action}' (want BUY|SELL)")
+        legs.append((action, int(con_id), int(ratio)))
+    return legs
+
+
+def _effective_leg_action(order_side: str, leg_action: str) -> str:
+    """IBKR semantics: SELLING a BAG reverses every leg's action."""
+    if order_side.upper() == "BUY":
+        return leg_action
+    return "SELL" if leg_action == "BUY" else "BUY"
+
+
+def _resolve_leg_contracts(ib: IB, legs: list[tuple[str, int, int]]) -> list[dict]:
+    """conId -> full contract fields, via the read-only session."""
+    out = []
+    for action, con_id, ratio in legs:
+        q = ib.qualifyContracts(Contract(conId=con_id))
+        if not q:
+            raise SystemExit(f"cannot resolve combo leg conId {con_id}")
+        c = q[0]
+        out.append({
+            "action": action, "con_id": con_id, "ratio": ratio,
+            "kind": getattr(c, "secType", "OPT"), "symbol": c.symbol.upper(),
+            "expiry": getattr(c, "lastTradeDateOrContractMonth", "") or None,
+            "right": (getattr(c, "right", "") or "").upper() or None,
+            "strike": float(c.strike) if getattr(c, "strike", 0) else None,
+        })
+    return out
+
+
+def cmd_constitution_check(args: argparse.Namespace) -> int:
+    """Evaluate the constitution against LIVE account state and persist the
+    verdict (the clearance a later `place`/`combo` transmits against). READ-ONLY."""
+    from trading_algo.config import TradingConfig
+    from trading_algo.constitution import combo_key, evaluate
+    from trading_algo.constitution_adapter import (
+        ProposedOrderInput, build_eval_context, record_verdict,
+    )
+    from trading_algo.persistence import SqliteStore
+
+    ib = _connect_readonly(args)
+    try:
+        account = _resolve_account(ib, args.account)
+        usd_rate = _make_usd_rate(ib)
+        net_liq = _combined_net_liq_usd(ib, usd_rate)
+        positions, contract_map = _positions_as_base(ib)
+        greeks_provider, spot_provider = _make_gateway_providers(
+            ib, wait=float(args.greeks_wait), contract_map=contract_map,
+            usd_rate=usd_rate)
+
+        db_path = args.db_path or TradingConfig.from_env().db_path
+        store = SqliteStore(db_path) if db_path else None
+        shim = _GatewaySnapshotBroker(account, net_liq, positions)
+        try:
+            if getattr(args, "legs", None):
+                decision, complete, missing, key, checks_out, extras = _check_combo(
+                    ib, args, account=account, store=store, shim=shim,
+                    greeks_provider=greeks_provider, spot_provider=spot_provider,
+                )
+            else:
+                decision, complete, missing, key, checks_out, extras = _check_single(
+                    args, account=account, store=store, shim=shim,
+                    greeks_provider=greeks_provider, spot_provider=spot_provider,
+                )
+        finally:
+            if store is not None:
+                store.close()
+
+        out = {
+            "decision": decision,
+            "complete": complete,
+            "missing": missing,
+            "order_key": key,
+            "account": account,
+            "combined_net_liq": net_liq,
+            "persisted": db_path is not None,
+            "valid_for_s": TradingConfig.from_env().constitution_max_age_s,
+            **extras,
+            "checks": checks_out,
+        }
+        _emit(out, args.format)
+        if decision == "BLOCK":
+            print("BLOCKED — this order violates the constitution.", file=sys.stderr)
+            return 2
+        if not complete:
+            print(f"INCOMPLETE (missing: {', '.join(missing)}) — "
+                  "a transmit against this verdict will be refused.", file=sys.stderr)
+            return 2
+        return 0
+    finally:
+        ib.disconnect()
+
+
+def _rules_out(checks) -> list[dict]:
+    return [
+        {"rule": c.rule_id, "severity": c.severity, "status": c.status,
+         "observed": c.observed, "message": c.message}
+        for c in checks if c.status != "SKIP" or c.confidence == "LOW"
+    ]
+
+
+def _check_single(args, *, account, store, shim, greeks_provider, spot_provider):
+    from trading_algo.constitution import evaluate
+    from trading_algo.constitution_adapter import (
+        ProposedOrderInput, build_eval_context, record_verdict,
+    )
+    losing_30d = None
+    if store is not None:
+        losing_30d = store.recent_losing_put_close(args.symbol.upper(), within_s=30 * 86400)
+    proposed = ProposedOrderInput(
+        symbol=args.symbol, kind=args.kind, side=args.side,
+        quantity=float(args.qty), account=account,
+        right=args.right,
+        strike=float(args.strike) if args.strike is not None else None,
+        expiry=args.expiry, order_type=args.type,
+        limit_price=args.limit_price,
+        structure=args.structure, credit=args.credit,
+        is_new_program=bool(args.new_program),
+        written_exit=args.written_exit,
+        is_roll=bool(args.is_roll),
+        losing_put_close_same_underlying_30d=losing_30d,
+    )
+    ctx, meta = build_eval_context(shim, proposed, greeks_provider=greeks_provider,
+                                   spot_provider=spot_provider)
+    verdict = evaluate(ctx)
+    if store is not None:
+        record_verdict(store, verdict, meta, proposed)
+    extras = {"closes_long": ctx.trade.closes_long, "closes_short": ctx.trade.closes_short,
+              "structure": ctx.trade.structure}
+    return (verdict.decision, meta.complete, meta.missing, proposed.to_key(),
+            _rules_out(verdict.checks), extras)
+
+
+def _check_combo(ib, args, *, account, store, shim, greeks_provider, spot_provider):
+    """Per-leg constitution evaluation for a BAG order; ONE verdict persisted
+    under the canonical leg-set key. Verdict = worst leg; complete = all legs."""
+    from trading_algo.constitution import combo_key, evaluate
+    from trading_algo.constitution_adapter import ProposedOrderInput, build_eval_context
+
+    legs = _parse_legs(args.legs)
+    resolved = _resolve_leg_contracts(ib, legs)
+    for r in resolved:
+        r["eff_action"] = _effective_leg_action(args.side, r["action"])
+    has_long_put = any(r["eff_action"] == "BUY" and r["right"] == "P" for r in resolved)
+    has_long_call = any(r["eff_action"] == "BUY" and r["right"] == "C" for r in resolved)
+
+    rank = {"PASS": 0, "WARN": 1, "BLOCK": 2}
+    decision = "PASS"
+    complete = True
+    missing: list[str] = []
+    checks_out: list[dict] = []
+    leg_summary: list[dict] = []
+    produced_at = None
+    for i, r in enumerate(resolved):
+        structure = None
+        # A short leg PAIRED with a long same-right leg is a defined-risk
+        # spread: the naked-put rules (C8 entry gate, assignment caps) don't
+        # apply, but TFSA (C6) and the DTE cap (C4) still do.
+        if r["eff_action"] == "SELL" and r["right"] == "P" and has_long_put:
+            structure = "put-credit-spread"
+        elif r["eff_action"] == "SELL" and r["right"] == "C" and has_long_call:
+            structure = "call-credit-spread"
+        losing_30d = None
+        if store is not None:
+            losing_30d = store.recent_losing_put_close(r["symbol"], within_s=30 * 86400)
+        lp = ProposedOrderInput(
+            symbol=r["symbol"], kind=r["kind"], side=r["eff_action"],
+            quantity=float(args.qty) * r["ratio"], account=account,
+            right=r["right"], strike=r["strike"], expiry=r["expiry"],
+            order_type=args.type, structure=structure,
+            written_exit=args.written_exit, is_roll=bool(args.is_roll),
+            losing_put_close_same_underlying_30d=losing_30d,
+        )
+        ctx, meta = build_eval_context(shim, lp, greeks_provider=greeks_provider,
+                                       spot_provider=spot_provider)
+        v = evaluate(ctx)
+        if produced_at is None:
+            produced_at = meta.produced_at
+        if rank[v.decision] > rank[decision]:
+            decision = v.decision
+        complete = complete and meta.complete
+        missing.extend(f"leg{i}:{m}" for m in meta.missing)
+        for c in _rules_out(v.checks):
+            checks_out.append({**c, "leg": i, "leg_desc":
+                               f"{r['eff_action']} {r['symbol']} {r['right'] or ''}{r['strike'] or ''} x{r['ratio']}"})
+        leg_summary.append({"leg": i, "conId": r["con_id"], "desc":
+                            f"{r['eff_action']} {r['symbol']} {r['right'] or ''}{r['strike'] or ''} "
+                            f"{r['expiry'] or ''} x{float(args.qty) * r['ratio']:g}",
+                            "structure": ctx.trade.structure,
+                            "closes_long": ctx.trade.closes_long,
+                            "closes_short": ctx.trade.closes_short,
+                            "decision": v.decision, "complete": meta.complete})
+
+    key = combo_key(legs=legs, side=args.side, quantity=float(args.qty),
+                    symbol=args.symbol, account=account,
+                    limit_price=args.limit_price, order_type=args.type)
+    if store is not None:
+        store.log_constitution_verdict(
+            order_key=key, decision=decision, complete=complete, checks=checks_out,
+            symbol=args.symbol.upper(), account=account,
+            context={"missing": missing, "legs": leg_summary},
+            ts_epoch_s=produced_at,
+        )
+    return decision, complete, missing, key, checks_out, {"legs": leg_summary}
+
+
+def _require_family_b_clearance(
+    *, symbol: str, kind: str, side: str, qty: float, right: str | None,
+    strike: float | None, expiry: str | None, account: str,
+    limit_price: float | None, order_type: str, order_ref: str,
+) -> None:
+    """Family B chokepoint (raw ib.placeOrder path): same fail-closed clearance
+    as the OMS/broker sites. No-op unless TRADING_CONSTITUTION_REQUIRED=true."""
+    from trading_algo.config import TradingConfig
+    from trading_algo.constitution_clearance import verify_clearance
+    from trading_algo.persistence import SqliteStore
+
+    cfg = TradingConfig.from_env()
+    if not cfg.constitution_required:
+        return
+    store = SqliteStore(cfg.db_path) if cfg.db_path else None
+    try:
+        verify_clearance(
+            store, symbol=symbol, kind=kind, side=side, quantity=qty,
+            right=right, strike=strike, expiry=expiry, account=account,
+            limit_price=limit_price, order_type=order_type,
+            required=True, max_age_s=cfg.constitution_max_age_s,
+            order_ref=order_ref,
+        )
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _require_combo_clearance(
+    *, legs: list[tuple[str, int, int]], side: str, qty: float, symbol: str,
+    account: str, limit_price: float | None, order_type: str, order_ref: str,
+) -> None:
+    """Family B chokepoint for BAG orders, keyed by the canonical leg set."""
+    from trading_algo.config import TradingConfig
+    from trading_algo.constitution_clearance import verify_combo_clearance
+    from trading_algo.persistence import SqliteStore
+
+    cfg = TradingConfig.from_env()
+    if not cfg.constitution_required:
+        return
+    store = SqliteStore(cfg.db_path) if cfg.db_path else None
+    try:
+        verify_combo_clearance(
+            store, legs=legs, side=side, quantity=qty, symbol=symbol,
+            account=account, limit_price=limit_price, order_type=order_type,
+            required=True, max_age_s=cfg.constitution_max_age_s,
+            order_ref=order_ref,
+        )
+    finally:
+        if store is not None:
+            store.close()
+
+
 def cmd_place(args: argparse.Namespace) -> int:
     # Halt sentinel check — refuses writes while data/HALTED exists.
     from trading_algo.halt import assert_not_halted
@@ -1122,17 +1650,34 @@ def cmd_place(args: argparse.Namespace) -> int:
     if not args.yes:
         raise SystemExit("Refusing to place live order without --yes confirmation flag.")
     ib = _connect(args)
-    c = _build_contract(args)
-    ib.qualifyContracts(c)
-    o = _build_order(args)
-    o.account = _resolve_account(ib, o.account or None)
-    trade = ib.placeOrder(c, o)
-    ok = _wait_for_order_ack(ib, trade, timeout=float(args.wait_timeout))
-    out = _order_dict(trade)
-    out["account"] = o.account
-    _emit(out, args.format)
-    ib.disconnect()
-    return 0 if ok else 1
+    try:
+        c = _build_contract(args)
+        ib.qualifyContracts(c)
+        o = _build_order(args)
+        o.account = _resolve_account(ib, o.account or None)
+        # Constitution clearance (fail-closed when TRADING_CONSTITUTION_REQUIRED=true).
+        # The claim binds to orderRef, so ensure one exists (visible in the IBKR log).
+        if not o.orderRef:
+            import uuid as _uuid
+            o.orderRef = f"TA{_uuid.uuid4().hex[:18]}"
+        _require_family_b_clearance(
+            symbol=args.symbol.upper(), kind=args.kind, side=args.side,
+            qty=float(args.qty), right=args.right,
+            strike=float(args.strike) if args.strike is not None else None,
+            expiry=args.expiry, account=o.account,
+            limit_price=args.limit_price, order_type=args.type, order_ref=o.orderRef,
+        )
+        trade = ib.placeOrder(c, o)
+        ok = _wait_for_order_ack(ib, trade, timeout=float(args.wait_timeout))
+        out = _order_dict(trade)
+        out["account"] = o.account
+        _emit(out, args.format)
+        return 0 if ok else 1
+    finally:
+        # A gate refusal must not leak the API connection — a stuck clientId
+        # would block every subsequent tool invocation.
+        if ib.isConnected():
+            ib.disconnect()
 
 
 def cmd_combo(args: argparse.Namespace) -> int:
@@ -1142,35 +1687,49 @@ def cmd_combo(args: argparse.Namespace) -> int:
     """Place a multi-leg BAG order. Legs: --legs 'BUY:conId:ratio,SELL:conId:ratio,...'"""
     if not args.yes:
         raise SystemExit("Refusing to place live combo order without --yes confirmation flag.")
+    parsed_legs = _parse_legs(args.legs)
     ib = _connect(args)
-    legs = []
-    for leg_spec in args.legs.split(","):
-        parts = leg_spec.strip().split(":")
-        if len(parts) != 3:
-            raise SystemExit(f"bad leg spec '{leg_spec}' (want ACTION:conId:ratio)")
-        action, con_id, ratio = parts
-        legs.append(ComboLeg(conId=int(con_id), ratio=int(ratio), action=action.upper(), exchange=args.exchange or "SMART"))
-    bag = Bag(symbol=args.symbol, currency=args.currency or "USD", exchange=args.exchange or "SMART")
-    bag.comboLegs = legs
-    o = Order()
-    o.action = args.side
-    o.totalQuantity = float(args.qty)
-    o.orderType = args.type
-    if args.limit_price is not None:
-        o.lmtPrice = float(args.limit_price)
-    o.tif = args.tif
-    o.account = _resolve_account(ib, args.account)
-    if args.order_ref:
-        o.orderRef = args.order_ref
-    o.transmit = not args.no_transmit
-    trade = ib.placeOrder(bag, o)
-    ok = _wait_for_order_ack(ib, trade, timeout=float(args.wait_timeout))
-    out = _order_dict(trade)
-    out["legs"] = [(l.action, l.conId, l.ratio) for l in legs]
-    out["account"] = o.account
-    _emit(out, args.format)
-    ib.disconnect()
-    return 0 if ok else 1
+    try:
+        legs = [
+            ComboLeg(conId=con_id, ratio=ratio, action=action,
+                     exchange=args.exchange or "SMART")
+            for action, con_id, ratio in parsed_legs
+        ]
+        bag = Bag(symbol=args.symbol, currency=args.currency or "USD", exchange=args.exchange or "SMART")
+        bag.comboLegs = legs
+        o = Order()
+        o.action = args.side
+        o.totalQuantity = float(args.qty)
+        o.orderType = args.type
+        if args.limit_price is not None:
+            o.lmtPrice = float(args.limit_price)
+        o.tif = args.tif
+        o.account = _resolve_account(ib, args.account)
+        if args.order_ref:
+            o.orderRef = args.order_ref
+        else:
+            import uuid as _uuid
+            o.orderRef = f"TA{_uuid.uuid4().hex[:18]}"
+        o.transmit = not args.no_transmit
+        # Constitution clearance under the canonical leg-set key (fail-closed
+        # when TRADING_CONSTITUTION_REQUIRED=true). Run `constitution-check
+        # --legs ...` with the SAME legs/side/qty/price/account first.
+        _require_combo_clearance(
+            legs=parsed_legs, side=args.side, qty=float(args.qty),
+            symbol=args.symbol, account=o.account,
+            limit_price=args.limit_price, order_type=args.type, order_ref=o.orderRef,
+        )
+        trade = ib.placeOrder(bag, o)
+        ok = _wait_for_order_ack(ib, trade, timeout=float(args.wait_timeout))
+        out = _order_dict(trade)
+        out["legs"] = [(l.action, l.conId, l.ratio) for l in legs]
+        out["account"] = o.account
+        _emit(out, args.format)
+        return 0 if ok else 1
+    finally:
+        # A gate refusal must not leak the API connection.
+        if ib.isConnected():
+            ib.disconnect()
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
@@ -1499,6 +2058,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_order_args(s)
     s.add_argument("--yes", action="store_true", help="Required live confirmation flag")
     s.add_argument("--wait-timeout", type=float, default=15.0, help="Seconds to wait for order ack (default 15)")
+
+    s = add("constitution-check", cmd_constitution_check,
+            "Evaluate the constitution gate against live account state (READ-ONLY; writes the clearance verdict)")
+    _add_contract_args(s)
+    _add_order_args(s)
+    s.add_argument("--legs", default=None,
+                   help="combo mode: 'BUY:conId:ratio,SELL:conId:ratio,...' — per-leg evaluation, one verdict under the leg-set key (contract args ignored; --symbol is the BAG symbol)")
+    s.add_argument("--structure", default=None,
+                   help="short-put | leap-long | pmcc-long | covered-call | roll | close (inferred from primitives when omitted)")
+    s.add_argument("--credit", type=float, default=None, help="expected fill credit/share (C8 denominator; defaults to --limit-price)")
+    s.add_argument("--written-exit", dest="written_exit", default=None, help="W5: the written exit plan (required for new positions)")
+    s.add_argument("--is-roll", dest="is_roll", action="store_true")
+    s.add_argument("--new-program", dest="new_program", action="store_true", help="C9: first trade of a new option program")
+    s.add_argument("--db-path", dest="db_path", default=None, help="override TRADING_DB_PATH for the verdict store")
+    s.add_argument("--greeks-wait", dest="greeks_wait", type=float, default=8.0, help="seconds to wait for modelGreeks per contract")
 
     s = add("combo", cmd_combo, "Place multi-leg BAG combo order")
     s.add_argument("--symbol", required=True)

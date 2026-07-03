@@ -130,6 +130,7 @@ _EXCEPTION_MAP: dict[str, ClassifiedError] = {
     "EnvParseError": ClassifiedError(USAGE, "USAGE", retryable=False),
     "ModificationLimitExceeded": ClassifiedError(HARD_REJECT, "HARD_REJECT", retryable=False),
     "RiskViolation": ClassifiedError(VALIDATION, "VALIDATION", retryable=False),
+    "ConstitutionViolation": ClassifiedError(VALIDATION, "VALIDATION", retryable=False),
 }
 
 
