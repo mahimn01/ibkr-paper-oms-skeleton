@@ -19,9 +19,10 @@ import math
 import os
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 try:
     from ib_async import (
@@ -36,6 +37,8 @@ try:
         Option,
         Order,
         ScannerSubscription,
+        StartupFetch,
+        StartupFetchNONE,
         Stock,
         TagValue,
         Ticker,
@@ -82,15 +85,147 @@ DEFAULT_PORT = _env_int("IBKR_PORT", 4001)
 DEFAULT_CLIENT_ID = _env_int("IBKR_TOOL_CLIENT_ID", 177)
 
 
-def _connect(args: argparse.Namespace) -> IB:
+def _connect(
+    args: argparse.Namespace,
+    *,
+    readonly: bool = False,
+    account: str = "",
+    raise_sync_errors: bool = False,
+    fetch_fields: Any | None = None,
+) -> IB:
+    """Connect with explicit synchronization controls.
+
+    ``ib_async`` 2.1 synchronizes account/portfolio state during connect when
+    an account is supplied. Read handlers use this instead of manually calling
+    the legacy ``reqAccountUpdates(subscribe, account)`` overload, which no
+    longer exists. ``fetch_fields`` lets discovery connections avoid unrelated
+    order/execution synchronization.
+    """
     ib = IB()
     host = args.host or DEFAULT_HOST
     port = args.port or DEFAULT_PORT
     client_id = args.client_id if args.client_id is not None else DEFAULT_CLIENT_ID
-    ib.connect(host, port, clientId=client_id, timeout=args.timeout)
-    if args.market_data_type:
-        ib.reqMarketDataType(args.market_data_type)
+    connect_kwargs: dict[str, Any] = {
+        "clientId": client_id,
+        "timeout": args.timeout,
+        "readonly": readonly,
+        "account": account,
+        "raiseSyncErrors": raise_sync_errors,
+    }
+    if fetch_fields is not None:
+        connect_kwargs["fetchFields"] = fetch_fields
+    ib.connect(host, port, **connect_kwargs)
+    market_data_type = getattr(args, "market_data_type", None)
+    if market_data_type:
+        ib.reqMarketDataType(market_data_type)
     return ib
+
+
+@contextmanager
+def _ib_session(
+    args: argparse.Namespace,
+    *,
+    readonly: bool = False,
+    account: str = "",
+    raise_sync_errors: bool = False,
+    fetch_fields: Any | None = None,
+) -> Iterator[IB]:
+    """Yield an IB session and never leak its client ID on failure."""
+    ib = _connect(
+        args,
+        readonly=readonly,
+        account=account,
+        raise_sync_errors=raise_sync_errors,
+        fetch_fields=fetch_fields,
+    )
+    try:
+        yield ib
+    finally:
+        active_error = sys.exc_info()[0] is not None
+        try:
+            if ib.isConnected():
+                ib.disconnect()
+        except Exception:
+            # Preserve the command's original exception. If cleanup itself is
+            # the only failure, surface it to the shared error classifier.
+            if not active_error:
+                raise
+
+
+def _account_targets(ib: IB, requested: str | None) -> list[str]:
+    """Resolve and validate account scope deterministically."""
+    accounts = sorted({str(a) for a in (ib.managedAccounts() or []) if a})
+    if not accounts:
+        raise RuntimeError("IBKR returned no managed accounts for this session")
+    if requested:
+        if requested not in accounts:
+            raise ValueError(
+                f"Unknown IBKR account {requested!r}; managed accounts: {accounts}"
+            )
+        return [requested]
+    return accounts
+
+
+def _discover_account_targets(args: argparse.Namespace) -> list[str]:
+    """Discover account scope without syncing orders or executions."""
+    with _ib_session(
+        args,
+        readonly=True,
+        fetch_fields=StartupFetchNONE,
+    ) as ib:
+        return _account_targets(ib, getattr(args, "account", None))
+
+
+def _finite_ib_float(value: Any) -> float | None:
+    """Normalize IBKR numeric sentinels and non-finite values to ``None``."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number == util.UNSET_DOUBLE:
+        return None
+    return number
+
+
+def _wait_for_pnl_updates(
+    ib: IB,
+    objects: list[Any],
+    *,
+    timeout: float,
+    single: bool = False,
+) -> None:
+    """Wait until every PnL subscription has received an actual update.
+
+    PnL dataclasses start with NaN fields (and ``PnLSingle.position`` starts at
+    zero), so emitting immediately can misreport a real position as flat. A
+    timeout is safer than returning those constructor defaults as live data.
+    """
+    fields = (
+        ("dailyPnL", "unrealizedPnL", "realizedPnL", "value")
+        if single
+        else ("dailyPnL", "unrealizedPnL", "realizedPnL")
+    )
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        pending = [
+            obj
+            for obj in objects
+            if not any(
+                _finite_ib_float(getattr(obj, field, None)) is not None
+                for field in fields
+            )
+        ]
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            kind = "position PnL" if single else "account PnL"
+            raise TimeoutError(
+                f"Timed out after {timeout:g}s waiting for initial {kind} update"
+            )
+        ib.sleep(min(0.1, remaining))
 
 
 # ============================================================
@@ -99,7 +234,9 @@ def _connect(args: argparse.Namespace) -> IB:
 
 def _to_jsonable(obj: Any) -> Any:
     if obj is None or isinstance(obj, (str, int, float, bool)):
-        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        if isinstance(obj, float) and (
+            not math.isfinite(obj) or obj == util.UNSET_DOUBLE
+        ):
             return None
         return obj
     if isinstance(obj, (list, tuple, set)):
@@ -239,127 +376,235 @@ def cmd_user_info(args: argparse.Namespace) -> int:
 # ============================================================
 
 def cmd_summary(args: argparse.Namespace) -> int:
-    ib = _connect(args)
     tags = args.tags or "NetLiquidation,TotalCashValue,SettledCash,AccruedCash,BuyingPower,EquityWithLoanValue,GrossPositionValue,InitMarginReq,MaintMarginReq,AvailableFunds,ExcessLiquidity,Cushion,FullInitMarginReq,FullMaintMarginReq,FullAvailableFunds,FullExcessLiquidity,LookAheadNextChange,LookAheadInitMarginReq,LookAheadMaintMarginReq,LookAheadAvailableFunds,LookAheadExcessLiquidity,HighestSeverity,DayTradesRemaining,Leverage,$LEDGER:ALL"
-    rows = ib.accountSummary(args.account or "")
-    out = []
-    wanted = set(t.strip() for t in tags.split(","))
-    for s in rows:
-        if args.account and s.account != args.account:
-            continue
-        if "$LEDGER:ALL" not in wanted and s.tag not in wanted and s.tag != "$LEDGER":
-            continue
-        out.append({"account": s.account, "tag": s.tag, "value": s.value, "currency": s.currency})
-    _emit(out, args.format)
-    ib.disconnect()
+    wanted = {tag.strip() for tag in tags.split(",") if tag.strip()}
+    with _ib_session(
+        args,
+        readonly=True,
+        fetch_fields=StartupFetchNONE,
+    ) as ib:
+        _account_targets(ib, args.account)
+        rows = ib.accountSummary(args.account or "")
+        out = []
+        for item in rows:
+            if args.account and item.account != args.account:
+                continue
+            if (
+                "$LEDGER:ALL" not in wanted
+                and item.tag not in wanted
+                and item.tag != "$LEDGER"
+            ):
+                continue
+            out.append({
+                "account": item.account,
+                "tag": item.tag,
+                "value": item.value,
+                "currency": item.currency,
+            })
+        out.sort(key=lambda row: (row["account"], row["tag"], row["currency"]))
+        _emit(out, args.format)
     return 0
 
 
 def cmd_values(args: argparse.Namespace) -> int:
-    ib = _connect(args)
-    ib.reqAccountUpdates(args.account or "")
-    ib.sleep(2.0)
-    values = [
-        {"account": v.account, "tag": v.tag, "value": v.value, "currency": v.currency, "modelCode": v.modelCode}
-        for v in ib.accountValues(args.account or "")
-    ]
+    values = []
+    for account in _discover_account_targets(args):
+        # ACCOUNT_UPDATES is the only startup subscription that populates both
+        # accountValues and portfolio. connect() bounds the initial download by
+        # --timeout and disconnect() reliably unsubscribes it.
+        with _ib_session(
+            args,
+            readonly=True,
+            account=account,
+            raise_sync_errors=True,
+            fetch_fields=StartupFetch.ACCOUNT_UPDATES,
+        ) as ib:
+            for item in ib.accountValues():
+                if item.account != account:
+                    continue
+                values.append({
+                    "account": item.account,
+                    "tag": item.tag,
+                    "value": item.value,
+                    "currency": item.currency,
+                    "modelCode": item.modelCode,
+                })
     if args.tag:
-        values = [v for v in values if args.tag.lower() in v["tag"].lower()]
+        needle = args.tag.casefold()
+        values = [v for v in values if needle in v["tag"].casefold()]
+    values.sort(
+        key=lambda row: (
+            row["account"], row["tag"], row["currency"], row["modelCode"]
+        )
+    )
     _emit(values, args.format)
-    ib.disconnect()
     return 0
 
 
 def cmd_positions(args: argparse.Namespace) -> int:
-    ib = _connect(args)
-    positions = ib.positions(args.account or "")
-    out = []
-    for p in positions:
-        c = p.contract
-        out.append({
-            "account": p.account,
-            "conId": c.conId,
-            "secType": c.secType,
-            "symbol": c.symbol,
-            "localSymbol": c.localSymbol,
-            "currency": c.currency,
-            "exchange": c.exchange,
-            "expiry": getattr(c, "lastTradeDateOrContractMonth", "") or "",
-            "right": getattr(c, "right", "") or "",
-            "strike": getattr(c, "strike", 0.0) or 0.0,
-            "multiplier": getattr(c, "multiplier", "") or "",
-            "position": p.position,
-            "avgCost": p.avgCost,
-            "marketValue": p.position * p.avgCost,
-        })
-    if args.symbol:
-        out = [r for r in out if r["symbol"] == args.symbol]
-    _emit(out, args.format)
-    ib.disconnect()
+    with _ib_session(
+        args,
+        readonly=True,
+        fetch_fields=StartupFetchNONE,
+    ) as ib:
+        accounts = set(_account_targets(ib, args.account))
+        out = []
+        for position in ib.positions():
+            if position.account not in accounts:
+                continue
+            contract = position.contract
+            quantity = _finite_ib_float(position.position)
+            avg_cost = _finite_ib_float(position.avgCost)
+            cost_basis = (
+                quantity * avg_cost
+                if quantity is not None and avg_cost is not None
+                else None
+            )
+            out.append({
+                "account": position.account,
+                "conId": contract.conId,
+                "secType": contract.secType,
+                "symbol": contract.symbol,
+                "localSymbol": contract.localSymbol,
+                "currency": contract.currency,
+                "exchange": contract.exchange,
+                "expiry": (
+                    getattr(contract, "lastTradeDateOrContractMonth", "") or ""
+                ),
+                "right": getattr(contract, "right", "") or "",
+                "strike": getattr(contract, "strike", 0.0) or 0.0,
+                "multiplier": getattr(contract, "multiplier", "") or "",
+                "position": quantity,
+                "avgCost": avg_cost,
+                # positions() has no live mark. The old implementation called
+                # this marketValue, but quantity * average cost is cost basis.
+                "costBasis": cost_basis,
+            })
+        if args.symbol:
+            symbol = args.symbol.casefold()
+            out = [r for r in out if r["symbol"].casefold() == symbol]
+        out.sort(
+            key=lambda row: (
+                row["account"], row["symbol"], row["secType"], row["localSymbol"]
+            )
+        )
+        _emit(out, args.format)
     return 0
 
 
 def cmd_portfolio(args: argparse.Namespace) -> int:
-    ib = _connect(args)
-    ib.reqAccountUpdates(True, args.account or "")
-    ib.sleep(2.0)
-    items = ib.portfolio(args.account or "")
     out = []
-    for p in items:
-        c = p.contract
-        out.append({
-            "account": p.account,
-            "secType": c.secType,
-            "symbol": c.symbol,
-            "localSymbol": c.localSymbol,
-            "position": p.position,
-            "marketPrice": p.marketPrice,
-            "marketValue": p.marketValue,
-            "avgCost": p.averageCost,
-            "unrealizedPNL": p.unrealizedPNL,
-            "realizedPNL": p.realizedPNL,
-        })
+    for account in _discover_account_targets(args):
+        with _ib_session(
+            args,
+            readonly=True,
+            account=account,
+            raise_sync_errors=True,
+            fetch_fields=StartupFetch.ACCOUNT_UPDATES,
+        ) as ib:
+            # Filter ourselves instead of relying on portfolio(account), which
+            # was only added in ib_async 2.1 and is easy to misuse across
+            # multi-account sessions.
+            for item in ib.portfolio():
+                if item.account != account:
+                    continue
+                contract = item.contract
+                out.append({
+                    "account": item.account,
+                    "conId": contract.conId,
+                    "secType": contract.secType,
+                    "symbol": contract.symbol,
+                    "localSymbol": contract.localSymbol,
+                    "currency": contract.currency,
+                    "exchange": contract.exchange,
+                    "expiry": (
+                        getattr(contract, "lastTradeDateOrContractMonth", "")
+                        or ""
+                    ),
+                    "right": getattr(contract, "right", "") or "",
+                    "strike": getattr(contract, "strike", 0.0) or 0.0,
+                    "multiplier": getattr(contract, "multiplier", "") or "",
+                    "position": item.position,
+                    "marketPrice": item.marketPrice,
+                    "marketValue": item.marketValue,
+                    "avgCost": item.averageCost,
+                    "unrealizedPNL": item.unrealizedPNL,
+                    "realizedPNL": item.realizedPNL,
+                })
+    out.sort(
+        key=lambda row: (
+            row["account"], row["symbol"], row["secType"], row["localSymbol"]
+        )
+    )
     _emit(out, args.format)
-    ib.reqAccountUpdates(False, args.account or "")
-    ib.disconnect()
     return 0
 
 
 def cmd_pnl(args: argparse.Namespace) -> int:
-    ib = _connect(args)
-    accounts = [args.account] if args.account else ib.managedAccounts()
-    results = []
-    for acct in accounts:
-        pnl = ib.reqPnL(acct, "")
-        ib.sleep(2.0)
-        results.append({
-            "account": acct,
-            "dailyPnL": pnl.dailyPnL,
-            "unrealizedPnL": pnl.unrealizedPnL,
-            "realizedPnL": pnl.realizedPnL,
-        })
-        ib.cancelPnL(acct, "")
-    _emit(results, args.format)
-    ib.disconnect()
+    with _ib_session(
+        args,
+        readonly=True,
+        fetch_fields=StartupFetchNONE,
+    ) as ib:
+        accounts = _account_targets(ib, args.account)
+        subscriptions: list[tuple[str, Any]] = []
+        try:
+            for account in accounts:
+                subscriptions.append((account, ib.reqPnL(account, "")))
+            _wait_for_pnl_updates(
+                ib,
+                [pnl for _account, pnl in subscriptions],
+                timeout=args.wait,
+            )
+            results = [
+                {
+                    "account": account,
+                    "dailyPnL": pnl.dailyPnL,
+                    "unrealizedPnL": pnl.unrealizedPnL,
+                    "realizedPnL": pnl.realizedPnL,
+                }
+                for account, pnl in subscriptions
+            ]
+            _emit(results, args.format)
+        finally:
+            for account, _pnl in subscriptions:
+                try:
+                    ib.cancelPnL(account, "")
+                except Exception:
+                    pass
     return 0
 
 
 def cmd_pnl_single(args: argparse.Namespace) -> int:
-    ib = _connect(args)
-    pnl = ib.reqPnLSingle(args.account, "", args.con_id)
-    ib.sleep(2.0)
-    result = {
-        "account": args.account,
-        "conId": args.con_id,
-        "position": pnl.position,
-        "dailyPnL": pnl.dailyPnL,
-        "unrealizedPnL": pnl.unrealizedPnL,
-        "realizedPnL": pnl.realizedPnL,
-        "value": pnl.value,
-    }
-    ib.cancelPnLSingle(args.account, "", args.con_id)
-    _emit(result, args.format)
-    ib.disconnect()
+    with _ib_session(
+        args,
+        readonly=True,
+        fetch_fields=StartupFetchNONE,
+    ) as ib:
+        _account_targets(ib, args.account)
+        pnl = ib.reqPnLSingle(args.account, "", args.con_id)
+        try:
+            _wait_for_pnl_updates(
+                ib,
+                [pnl],
+                timeout=args.wait,
+                single=True,
+            )
+            result = {
+                "account": args.account,
+                "conId": args.con_id,
+                "position": pnl.position,
+                "dailyPnL": pnl.dailyPnL,
+                "unrealizedPnL": pnl.unrealizedPnL,
+                "realizedPnL": pnl.realizedPnL,
+                "value": pnl.value,
+            }
+            _emit(result, args.format)
+        finally:
+            try:
+                ib.cancelPnLSingle(args.account, "", args.con_id)
+            except Exception:
+                pass
     return 0
 
 
@@ -1418,10 +1663,6 @@ def cmd_constitution_check(args: argparse.Namespace) -> int:
     """Evaluate the constitution against LIVE account state and persist the
     verdict (the clearance a later `place`/`combo` transmits against). READ-ONLY."""
     from trading_algo.config import TradingConfig
-    from trading_algo.constitution import combo_key, evaluate
-    from trading_algo.constitution_adapter import (
-        ProposedOrderInput, build_eval_context, record_verdict,
-    )
     from trading_algo.persistence import SqliteStore
 
     ib = _connect_readonly(args)
@@ -1722,7 +1963,7 @@ def cmd_combo(args: argparse.Namespace) -> int:
         trade = ib.placeOrder(bag, o)
         ok = _wait_for_order_ack(ib, trade, timeout=float(args.wait_timeout))
         out = _order_dict(trade)
-        out["legs"] = [(l.action, l.conId, l.ratio) for l in legs]
+        out["legs"] = [(leg.action, leg.conId, leg.ratio) for leg in legs]
         out["account"] = o.account
         _emit(out, args.format)
         return 0 if ok else 1
@@ -1850,7 +2091,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--account", default=None)
     s.add_argument("--tags", default=None, help="Comma list or leave blank for defaults")
 
-    s = add("values", cmd_values, "Full account values via reqAccountUpdates")
+    s = add("values", cmd_values, "Full synchronized account values")
     s.add_argument("--account", default=None)
     s.add_argument("--tag", default=None, help="Substring filter on tag name")
 
@@ -1858,15 +2099,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--account", default=None)
     s.add_argument("--symbol", default=None)
 
-    s = add("portfolio", cmd_portfolio, "Portfolio items with MTM (via reqAccountUpdates)")
+    s = add("portfolio", cmd_portfolio, "Synchronized portfolio items with MTM")
     s.add_argument("--account", default=None)
 
     s = add("pnl", cmd_pnl, "Account-level daily/realized/unrealized PnL")
     s.add_argument("--account", default=None)
+    s.add_argument("--wait", type=float, default=5.0, help="Maximum seconds to wait for the initial PnL update")
 
     s = add("pnl-single", cmd_pnl_single, "Per-position PnL")
     s.add_argument("--account", required=True)
     s.add_argument("--con-id", type=int, required=True)
+    s.add_argument("--wait", type=float, default=5.0, help="Maximum seconds to wait for the initial PnL update")
 
     # --- Quotes / live data ---
     s = add("quote", cmd_quote, "Snap quote for one contract (includes greeks for OPT)")
