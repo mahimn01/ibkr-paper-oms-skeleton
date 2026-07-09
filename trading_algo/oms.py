@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from trading_algo.broker.base import Broker, OrderRequest, OrderResult, OrderStatus
 from trading_algo.config import TradingConfig
+from trading_algo.constitution_clearance import verify_clearance
 from trading_algo.halt import assert_not_halted
 from trading_algo.orders import TradeIntent
 from trading_algo.persistence import SqliteStore
@@ -103,10 +104,27 @@ class OrderManager:
         if self._cfg.dry_run:
             self._log_error("oms.submit", "dry_run")
             return OMSResult(order_id="dry-run", status="DryRun")
+        # Constitution clearance is the last gate before a real transmit. It is
+        # the cheap persisted-verdict backstop (no IBKR round-trip): the rich
+        # evaluation runs upstream (constitution-check CLI / cli gate) and writes
+        # a verdict keyed by order primitives. Fail-CLOSED when required.
+        self._require_constitution_clearance(req)
         res = self._broker.place_order(req)
         self._log_order(req, res)
         self._log_status(res.order_id)
         return OMSResult(order_id=res.order_id, status=res.status)
+
+    def _require_constitution_clearance(self, req: OrderRequest) -> None:
+        inst = req.instrument
+        verify_clearance(
+            self._store,
+            symbol=inst.symbol, kind=inst.kind, side=req.side, quantity=req.quantity,
+            right=inst.right, strike=inst.strike, expiry=inst.expiry, account=req.account,
+            limit_price=req.limit_price, order_type=req.order_type,
+            required=self._cfg.constitution_required,
+            max_age_s=self._cfg.constitution_max_age_s,
+            order_ref=req.order_ref,
+        )
 
     @staticmethod
     def _require_idempotency_key(req: OrderRequest) -> None:
@@ -148,6 +166,8 @@ class OrderManager:
         if self._cfg.dry_run:
             self._log_error("oms.modify", "dry_run")
             return OMSResult(order_id=str(order_id), status="DryRun")
+        # A modify routes NEW exposure to the venue — same clearance as submit.
+        self._require_constitution_clearance(new_req)
         res = self._broker.modify_order(str(order_id), new_req)
         self._log_order(new_req, res)
         self._log_status(str(order_id))

@@ -4,6 +4,22 @@ Complete project history, regenerated from `git log` on 2026-04-14. Every
 commit on `main` (and every commit pending merge) is listed with its author
 date and short SHA.
 
+## 2026-07
+
+### Unreleased — IBKR account CLI correctness and lifecycle hardening
+
+- Replaced obsolete `reqAccountUpdates(subscribe, account)` calls with
+  bounded, account-scoped `ib_async` 2.1 startup synchronization.
+- Made `values` and `portfolio` return complete deterministic snapshots for
+  every managed account, including multi-account logins.
+- Corrected `positions.marketValue`, which was actually cost basis, to the
+  accurately named `costBasis`; live mark-to-market remains in `portfolio`.
+- Added read-only sessions, guaranteed disconnect/PnL cancellation cleanup,
+  account validation, and normalization of IBKR unset numeric sentinels.
+- PnL commands now require a real initial broker update and fail with a
+  retryable timeout instead of emitting NaN/default-flat placeholder data.
+- Bounded the supported dependency range to `ib_async>=2.1.0,<3.0.0`.
+
 ## 2026-05
 
 ### Unreleased — Wave T5: enterprise foundation (PIT data, cost realism, validation)
